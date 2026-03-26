@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DrowseGuard</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+<style>
+
+  #analyticsContainer {
+    width: 100%;
+    height: 300px;
+  }
+
+  #analyticsChart {
+    width: 100% !important;
+    height: 100% !important;
+    display: block;
+  }
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #111318; --bg2: #181c24; --bg3: #1f2433;
+  --border: rgba(255,255,255,0.08);
+  --text: #e2e4ea; --muted: #6b7280;
+  --green: #22c55e; --red: #ef4444; --amber: #f59e0b;
+  --font-mono: 'Space Mono', monospace;
+  --font: 'Inter', sans-serif;
+  --r: 10px;
+}
+html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; }
+
+.shell { max-width: 860px; margin: 0 auto; padding: 32px 20px 60px; }
+
+header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 36px; }
+.logo { display: flex; align-items: center; gap: 10px; }
+.logo-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); transition: background 0.4s; }
+.logo-text { font-size: 16px; font-weight: 500; letter-spacing: -0.3px; }
+.logo-sub { font-size: 11px; color: var(--muted); margin-left: 4px; }
+nav { display: flex; gap: 4px; }
+.nav-btn {
+  padding: 7px 14px; border-radius: 7px; cursor: pointer; font-family: var(--font);
+  font-size: 13px; background: none; border: none; color: var(--muted); transition: all 0.15s;
+}
+.nav-btn:hover { color: var(--text); background: var(--bg3); }
+.nav-btn.active { color: var(--text); background: var(--bg2); }
+
+.page { display: none; }
+.page.active { display: block; }
+
+.card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r); padding: 20px 22px; }
+.card + .card { margin-top: 12px; }
+
+.detect-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+.cam-box {
+  background: #000; border: 1px solid var(--border); border-radius: var(--r);
+  aspect-ratio: 4/3; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 8px;
+  color: var(--muted); font-size: 13px;
+}
+.cam-icon svg { width: 40px; height: 40px; opacity: 0.2; }
+
+.conn-banner {
+  background: rgba(245,158,11,0.12); border: 1px solid rgba(245,158,11,0.25);
+  border-radius: 8px; padding: 10px 14px; font-size: 12px; color: var(--amber);
+  display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
+}
+.conn-banner.ok { background: rgba(34,197,94,0.1); border-color: rgba(34,197,94,0.2); color: var(--green); }
+.conn-banner.hidden { display: none; }
+
+.status-big {
+  text-align: center; padding: 28px 20px;
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+}
+.ear-num { font-family: var(--font-mono); font-size: 52px; font-weight: 700; line-height: 1; transition: color 0.3s; }
+.ear-num.ok   { color: var(--green); }
+.ear-num.warn { color: var(--amber); }
+.ear-num.bad  { color: var(--red); animation: flicker 0.6s infinite; }
+@keyframes flicker { 0%,100%{opacity:1} 50%{opacity:.55} }
+
+.state-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 14px; border-radius: 20px; font-size: 12px; font-weight: 500; letter-spacing: 0.4px;
+}
+.state-pill.alert  { background: rgba(34,197,94,0.12);  color: var(--green); }
+.state-pill.drowsy { background: rgba(239,68,68,0.12);  color: var(--red); }
+.state-pill.idle   { background: var(--bg3); color: var(--muted); }
+.state-pill .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+.thr-label { font-size: 11px; color: var(--muted); font-family: var(--font-mono); }
+
+.frame-row { display: flex; align-items: center; gap: 10px; margin-top: 16px; }
+.frame-bar-wrap { flex: 1; height: 5px; background: var(--bg3); border-radius: 3px; overflow: hidden; }
+.frame-bar-fill { height: 100%; width: 0%; background: var(--amber); border-radius: 3px; transition: width 0.2s; }
+.frame-label { font-family: var(--font-mono); font-size: 11px; color: var(--muted); white-space: nowrap; }
+
+.stats-row { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; margin-top: 12px; }
+.stat { background: var(--bg3); border-radius: 8px; padding: 12px 14px; }
+.stat-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px; }
+.stat-val { font-family: var(--font-mono); font-size: 20px; font-weight: 700; }
+
+.chart-wrap { height: 140px; margin-top: 14px; }
+
+.controls { display: flex; gap: 8px; margin-top: 14px; }
+.btn {
+  flex: 1; padding: 10px 0; border-radius: 8px; font-family: var(--font);
+  font-size: 13px; font-weight: 500; cursor: pointer; border: 1px solid var(--border);
+  background: var(--bg3); color: var(--text); transition: all 0.15s;
+}
+.btn:hover { background: var(--bg2); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn.start { background: var(--green); color: #0a1a0f; border-color: var(--green); font-weight: 600; }
+.btn.start:hover:not(:disabled) { background: #16a34a; }
+.btn.stop  { background: rgba(239,68,68,0.15); color: var(--red); border-color: rgba(239,68,68,0.3); }
+.btn.stop:hover { background: rgba(239,68,68,0.25); }
+
+.calib-center { text-align: center; padding: 32px 20px; }
+.ring-wrap {
+  position: relative;
+  width: 140px;
+  height: 140px;
+  flex-shrink: 0;   /* 🔥 prevents stretching */
+}
+.ring-wrap svg { position: absolute; top: 0; left: 0; width: 140px; height: 140px; transform: rotate(-90deg); }
+.ring-wrap circle { fill: none; stroke-width: 3; }
+.ring-track { stroke: var(--bg3); }
+.ring-fill  { stroke: var(--amber); stroke-linecap: round; stroke-dasharray: 408; stroke-dashoffset: 408; transition: stroke-dashoffset 0.4s; }
+.ring-inner { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.ring-pct   { font-family: var(--font-mono); font-size: 28px; font-weight: 700; color: var(--amber); }
+.ring-sub   { font-size: 10px; color: var(--muted); margin-top: 2px; }
+.calib-desc { font-size: 13px; color: var(--muted); max-width: 320px; margin: 0 auto 20px; line-height: 1.7; }
+.calib-result {
+  background: var(--bg3); border-radius: 8px; padding: 14px 18px;
+  display: flex; justify-content: space-between; align-items: center; margin-top: 16px;
+}
+.cr-label { font-size: 12px; color: var(--muted); }
+.cr-val { font-family: var(--font-mono); font-size: 18px; color: var(--amber); }
+
+.session-list { display: flex; flex-direction: column; gap: 8px; }
+.session-item {
+  background: var(--bg3); border-radius: 8px; padding: 13px 16px;
+  display: flex; align-items: center; gap: 14px;
+}
+.session-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.session-main { flex: 1; }
+.session-time { font-size: 12px; color: var(--muted); font-family: var(--font-mono); }
+.session-dur  { font-size: 13px; font-weight: 500; margin-top: 1px; }
+.session-pct  { font-family: var(--font-mono); font-size: 13px; color: var(--muted); }
+.empty { text-align: center; padding: 40px 20px; color: var(--muted); font-size: 13px; }
+
+.toast {
+  position: fixed; bottom: 20px; right: 20px;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r);
+  padding: 12px 16px; font-size: 13px; color: var(--text);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5); z-index: 999;
+  animation: toastIn 0.25s ease; transition: opacity 0.3s;
+}
+@keyframes toastIn { from{transform:translateY(10px);opacity:0} to{transform:translateY(0);opacity:1} }
+.toast.out { opacity: 0; }
+
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-thumb { background: var(--bg3); border-radius: 2px; }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <header>
+    <div class="logo">
+      <div class="logo-dot" id="sys-dot"></div>
+      <span class="logo-text">DrowseGuard</span>
+      <span class="logo-sub">Driver Monitor</span>
+    </div>
+    <nav>
+      <button class="nav-btn active" onclick="show('detect')">Detect</button>
+      <button class="nav-btn" onclick="show('calibrate')">Calibrate</button>
+      <button class="nav-btn" onclick="show('sessions');loadSessions()">Sessions</button>
+    </nav>
+  </header>
+
+  <!-- ── DETECT ── -->
+  <div class="page active" id="page-detect">
+
+    <div class="conn-banner" id="conn-banner">
+      <span>⚡</span> Connecting to backend…
+    </div>
+
+    <div class="detect-grid">
+      <div>
+        <div class="cam-box">
+          <div class="cam-icon" id="cam-icon">
+            <svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="20" cy="20" r="16"/>
+              <circle cx="20" cy="20" r="6"/>
+            </svg>
+          </div>
+
+          <img id="detect-feed"
+              src="http://localhost:5000/video_feed"
+              style="width:100%; border-radius:10px; display:none;" />
+
+          <span id="cam-label">Camera inactive</span>  <!-- ✅ ADD THIS -->
+        </div>
+        <div class="controls">
+          <button class="btn start" id="main-btn" onclick="toggleDetect()" disabled>▶  Start Detection</button>
+        </div>
+      </div>
+
+      <div>
+        <div class="card status-big">
+          <div class="thr-label" id="thr-label">— waiting —</div>
+          <div class="ear-num ok" id="ear-num">—</div>
+          <div id="ear-trend" style="
+            font-size:14px;
+            font-weight:500;
+            margin-top:4px;
+          color:var(--green);">—</div>
+          <div id="state-pill-wrap">
+            <span class="state-pill idle"><span class="dot"></span>IDLE</span>
+          </div>
+          <div style="width:100%">
+            <div class="frame-row">
+              <span class="frame-label">1.5s filter</span>
+              <div class="frame-bar-wrap"><div class="frame-bar-fill" id="frame-fill"></div></div>
+              <span class="frame-label" id="frame-ct">0 / 45</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat">
+            <div class="stat-label">Runtime</div>
+            <div class="stat-val" id="runtime" style="font-size:14px;padding-top:2px">00:00</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Alarms</div>
+            <div class="stat-val" id="alarm-ct" style="color:var(--red)">0</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">FPS</div>
+            <div class="stat-val" id="fps-stat" style="color:var(--muted)">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:2px">
+        <span style="font-size:12px;color:var(--muted)">EAR over time</span>
+        <span style="font-size:11px;color:var(--muted);font-family:var(--font-mono)" id="mean-ear">mean —</span>
+      </div>
+      <div class="chart-wrap"><canvas id="earChart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- ── CALIBRATE ── -->
+  <div class="page" id="page-calibrate">
+    <div class="card">
+      <div style="display: flex; gap: 20px; align-items: center; margin-bottom: 20px;">
+        <div class="cam-box" style="flex: 1;">
+          <img id="calib-feed" src="http://localhost:5000/video_feed" style="width:100%; border-radius:10px; display:none;" />
+        </div>
+        <div class="ring-wrap">
+          <svg viewBox="0 0 140 140">
+            <circle class="ring-track" cx="70" cy="70" r="65"/>
+            <circle class="ring-fill"  cx="70" cy="70" r="65" id="ring"/>
+          </svg>
+          <div class="ring-inner">
+            <div class="ring-pct" id="calib-pct">0%</div>
+            <div class="ring-sub" id="calib-sub">ready</div>
+          </div>
+        </div>
+      </div>
+      <p class="calib-desc">Look directly at the camera with eyes open. Stay still for 5 seconds while your personal EAR baseline is measured.</p>
+      <button class="btn" style="max-width:200px;margin:0 auto;display:block" id="calib-btn" onclick="startCalib()" disabled>Begin Calibration</button>
+
+      <div class="calib-result" id="calib-result" style="display:none">
+        <div>
+          <div class="cr-label">Calibrated threshold</div>
+          <div style="font-size:11px;color:var(--muted);margin-top:2px">mean EAR − 1.5σ</div>
+        </div>
+        <div class="cr-val" id="calib-val">—</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <div style="font-size:12px;color:var(--muted);margin-bottom:12px">Tips</div>
+      <div style="display:flex;flex-direction:column;gap:9px">
+        <div style="display:flex;gap:10px;font-size:13px;color:#9ca3af"><span style="color:var(--green);flex-shrink:0">✓</span>Sit at your normal driving position</div>
+        <div style="display:flex;gap:10px;font-size:13px;color:#9ca3af"><span style="color:var(--green);flex-shrink:0">✓</span>Good, even lighting on your face</div>
+        <div style="display:flex;gap:10px;font-size:13px;color:#9ca3af"><span style="color:var(--amber);flex-shrink:0">!</span>Don't blink or yawn during calibration</div>
+        <div style="display:flex;gap:10px;font-size:13px;color:#9ca3af"><span style="color:var(--amber);flex-shrink:0">!</span>Re-calibrate if lighting changes</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── SESSIONS ── -->
+  <div class="page" id="page-sessions">
+    <div class="card" style="margin-bottom:12px">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span style="font-size:13px;color:var(--muted)" id="sessions-count">Loading…</span>
+        <button class="btn" style="flex:0;padding:6px 14px;font-size:12px" onclick="exportCSV()">Export CSV</button>
+      </div>
+    </div>
+    <div class="session-list" id="session-list">
+      <div class="empty">No sessions yet — start detecting to record one.</div>
+    </div>
+    <div id="analyticsContainer" style="margin-top:20px; height:300px;">
+      <canvas id="analyticsChart"></canvas>
+    </div>
+  </div>
+
+</div>
+
+<script>
+
+const user = localStorage.getItem('user') || "driver1";
+// ── Socket.IO connection ───────────────────────────────────────────────────
+const socket = io();
+
+let running = false;
+let currentThreshold = 0.16;
+let earBuf = [];
+let prevEAR = null;
+// ── Connection state ──
+socket.on('connect', () => {
+  setBanner('ok', '✓ Connected to backend');
+  socket.emit('load_user', { user });
+  setTimeout(() => setBanner('hidden', ''), 2000);
+  document.getElementById('main-btn').disabled = false;
+  document.getElementById('calib-btn').disabled = false;
+  document.getElementById('sys-dot').style.background = 'var(--green)';
+});
+
+socket.on('user_loaded', (d) => {
+  currentThreshold = d.threshold;
+
+  document.getElementById('thr-label').textContent =
+    'threshold ' + d.threshold.toFixed(3);
+});
+
+socket.on('disconnect', () => {
+  setBanner('warn', '⚡ Disconnected — is server.py running?');
+  document.getElementById('sys-dot').style.background = 'var(--red)';
+  document.getElementById('main-btn').disabled = true;
+  document.getElementById('calib-btn').disabled = true;
+});
+
+socket.on('error', (d) => toast('Error: ' + d.msg));
+
+// ── Detection ──
+socket.on('started', () => {
+  running = true;
+  earBuf = [];
+  document.getElementById('main-btn').textContent = '⏹  Stop Detection';
+  document.getElementById('main-btn').className   = 'btn stop';
+  const label = document.getElementById('cam-label');
+  if (label) label.textContent = 'Camera active';
+  document.getElementById('sys-dot').style.background = 'var(--amber)';
+  document.getElementById('detect-feed').style.display = 'block';
+});
+
+socket.on('frame', (d) => {
+  currentThreshold = d.threshold;
+
+  earBuf.push(d.ear);
+  if (earBuf.length > 300) earBuf.shift();
+
+  // EAR number + colour
+  const n = document.getElementById('ear-num');
+  n.textContent = d.ear.toFixed(3);
+  n.className = 'ear-num ' + (d.ear < d.threshold ? 'bad' : d.ear < d.threshold + 0.03 ? 'warn' : 'ok');
+
+  // State pill
+  document.getElementById('state-pill-wrap').innerHTML = d.status === 'drowsy'
+    ? '<span class="state-pill drowsy"><span class="dot"></span>DROWSY</span>'
+    : '<span class="state-pill alert"><span class="dot"></span>ALERT</span>';
+
+  // Threshold label
+  document.getElementById('thr-label').textContent = 'threshold ' + d.threshold.toFixed(3);
+
+  // 3-second filter bar
+  document.getElementById('frame-fill').style.width = (d.drowsy_frames / 45 * 100) + '%';
+  document.getElementById('frame-ct').textContent = d.drowsy_frames + ' / 45';
+
+  // Stats
+  document.getElementById('alarm-ct').textContent = d.alarms;
+  document.getElementById('fps-stat').textContent  = d.fps;
+
+  // Runtime
+  const secs = d.runtime;
+  const m = Math.floor(secs / 60), s = secs % 60;
+  document.getElementById('runtime').textContent =
+    String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+
+  // Mean EAR
+  const mean = earBuf.reduce((a, b) => a + b, 0) / earBuf.length;
+  document.getElementById('mean-ear').textContent = 'mean ' + mean.toFixed(3);
+
+  // Chart
+  if (window.earChart && window.earChart.data) {
+    window.earChart.data.datasets[0].data = earBuf.slice();
+    window.earChart.data.datasets[1].data = Array(earBuf.length).fill(d.threshold);
+    window.earChart.data.labels = earBuf.map(() => '');
+    window.earChart.update('none');
+  }
+
+// ── TREND LOGIC (FINAL FIX) ──
+let trend = "—";
+
+if (earBuf.length > 10) {
+  const recent = earBuf.slice(-10);
+
+  const firstAvg = recent.slice(0, 5).reduce((a,b)=>a+b,0)/5;
+  const lastAvg  = recent.slice(5).reduce((a,b)=>a+b,0)/5;
+
+  if (lastAvg > firstAvg + 0.002) {
+    trend = "↑ improving";
+  } else if (lastAvg < firstAvg - 0.002) {
+    trend = "↓ drowsy";
+  } else {
+    trend = "→ stable";
+  }
+}
+
+console.log("TREND:", trend); // debug
+
+const trendEl = document.getElementById('ear-trend');
+trendEl.textContent = trend;
+
+if (trend.includes("↑")) {
+  trendEl.style.color = "var(--green)";
+} else if (trend.includes("↓")) {
+  trendEl.style.color = "var(--red)";
+} else {
+  trendEl.style.color = "var(--muted)";
+}
+});
+
+socket.on('stopped', (d) => {
+  running = false;
+  document.getElementById('main-btn').textContent = '▶  Start Detection';
+  document.getElementById('main-btn').className   = 'btn start';
+  const label = document.getElementById('cam-label');
+  if (label) label.textContent = 'Camera active';
+  document.getElementById('sys-dot').style.background = 'var(--green)';
+  document.getElementById('detect-feed').style.display = 'none';
+  setIdle();
+
+  // Save session
+  const alertFrames = earBuf.filter(e => e >= currentThreshold).length;
+  const alertPct    = earBuf.length ? Math.round(alertFrames / earBuf.length * 100) : 100;
+  const meanEar     = earBuf.length ? +(earBuf.reduce((a, b) => a + b, 0) / earBuf.length).toFixed(3) : 0;
+  socket.emit('save_session', {
+    runtime: d.runtime, alarms: d.alarms,
+    mean_ear: meanEar, threshold: currentThreshold, alert_pct: alertPct,
+    ear_series: earBuf
+  });
+
+  toast('Session ended — ' + d.alarms + ' alarm' + (d.alarms !== 1 ? 's' : ''));
+});
+
+// ── Calibration ──
+socket.on('calib_progress', (d) => {
+  const total = 408;
+  document.getElementById('ring').style.strokeDashoffset = total - (total * d.progress / 100);
+  document.getElementById('calib-pct').textContent = d.progress + '%';
+  document.getElementById('calib-sub').textContent  = 'collecting';
+});
+
+socket.on('calibrated', (d) => {
+  currentThreshold = d.threshold;
+
+  document.getElementById('ring').style.strokeDashoffset = 0;
+  document.getElementById('calib-pct').textContent = '✓';
+  document.getElementById('calib-sub').textContent = 'done';
+  document.getElementById('calib-result').style.display = 'flex';
+  document.getElementById('calib-val').textContent = d.threshold.toFixed(3);
+  document.getElementById('calib-feed').style.display = 'none';
+
+  toast('Calibration complete');
+  socket.emit('save_user_threshold', {
+    user,
+    threshold: d.threshold
+  });
+  // 🛑 STOP detection after calibration
+  socket.emit('stop');
+});
+
+// ── Sessions ──
+socket.on('sessions', renderSessions);
+
+// ── UI helpers ─────────────────────────────────────────────────────────────
+function show(id) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+
+  document.getElementById('page-' + id).classList.add('active');
+
+  // 🔥 IMPORTANT FIX
+  if (id !== 'detect') {
+    document.getElementById('detect-feed').style.display = 'none';
+  }
+  if (id !== 'calibrate') {
+    document.getElementById('calib-feed').style.display = 'none';
+  }
+
+  document.querySelectorAll('.nav-btn').forEach(b => {
+    if (b.textContent.toLowerCase().includes(id.slice(0, 4))) {
+      b.classList.add('active');
+    }
+  });
+
+  if (id === 'detect') setTimeout(initChart, 50);
+}
+
+function setBanner(type, msg) {
+  const el = document.getElementById('conn-banner');
+  el.className = 'conn-banner' + (type === 'hidden' ? ' hidden' : type === 'ok' ? ' ok' : '');
+  el.innerHTML = msg;
+}
+
+function setIdle() {
+  document.getElementById('ear-num').textContent = '—';
+  document.getElementById('ear-num').className   = 'ear-num ok';
+  document.getElementById('state-pill-wrap').innerHTML =
+    '<span class="state-pill idle"><span class="dot"></span>IDLE</span>';
+  document.getElementById('frame-fill').style.width = '0%';
+  document.getElementById('frame-ct').textContent   = '0 / 45';
+  document.getElementById('thr-label').textContent  = '— waiting —';
+  document.getElementById('fps-stat').textContent   = '—';
+}
+
+function toggleDetect() {
+  if (!running) socket.emit('start');
+  else          socket.emit('stop');
+}
+
+function startCalib() {
+  // Always stop detection first
+  socket.emit('stop');
+
+  // Reset UI
+  document.getElementById('calib-pct').textContent = '0%';
+  document.getElementById('calib-sub').textContent = 'collecting';
+  document.getElementById('ring').style.strokeDashoffset = '408';
+  document.getElementById('calib-result').style.display = 'none';
+
+  // Start backend (will auto-calibrate first)
+  setTimeout(() => {
+    socket.emit('start');
+    document.getElementById('calib-feed').style.display = 'block';
+  }, 500);
+}
+
+function loadSessions() { socket.emit('get_sessions'); }
+
+function renderSessions(data) {
+  const list  = document.getElementById('session-list');
+  const count = document.getElementById('sessions-count');
+  if (!data || !data.length) {
+    list.innerHTML  = '<div class="empty">No sessions yet — start detecting to record one.</div>';
+    count.textContent = '0 sessions';
+    return;
+  }
+  count.textContent = data.length + ' session' + (data.length !== 1 ? 's' : '');
+  list.innerHTML = data.map(s => {
+    const sec = s.duration || 0;
+    const h   = Math.floor(sec / 3600);
+    const m   = Math.floor((sec % 3600) / 60);
+    const sc  = sec % 60;
+    const dur = (h > 0 ? h + 'h ' : '') + m + 'm ' + sc + 's';
+    const ok  = (s.alert_pct || 0) >= 90;
+    const col = s.alarms > 10 ? 'var(--red)' : s.alarms > 3 ? 'var(--amber)' : 'var(--green)';
+    return `
+      <div class="session-item" onclick='openSession(${JSON.stringify(s)})'>
+          ${s.clip ? `
+          <img src="/${s.clip}" width="180" style="margin-top:6px;border-radius:6px"/>
+        ` : ''}
+        <div class="session-dot" style="background:${ok ? 'var(--green)' : 'var(--red)'}"></div>
+        <div class="session-main">
+          <div class="session-time">${s.date}</div>
+          <div class="session-dur">${dur}</div>
+        </div>
+        <div style="text-align:right">
+          <div class="session-pct" style="color:${col}">${s.alarms} alarm${s.alarms !== 1 ? 's' : ''}</div>
+          <div class="session-pct">${s.alert_pct || 0}% alert</div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function exportCSV() {
+  socket.emit('get_sessions');
+  socket.once('sessions', (data) => {
+    if (!data.length) { toast('No sessions to export'); return; }
+    const rows = ['Date,Duration (s),Alarms,Alert %,Mean EAR,Threshold']
+      .concat(data.map(s => `${s.date},${s.duration},${s.alarms},${s.alert_pct},${s.mean_ear},${s.threshold}`))
+      .join('\n');
+    const a = Object.assign(document.createElement('a'), {
+      href: URL.createObjectURL(new Blob([rows], { type: 'text/csv' })),
+      download: 'sessions.csv',
+    });
+    a.click();
+    toast('Exported sessions.csv');
+  });
+}
+
+// ── Chart ──────────────────────────────────────────────────────────────────
+function initChart() {
+  const ctx = document.getElementById('earChart');
+  if (!ctx || window.earChart) return;
+  window.earChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { data: [], borderColor: '#3b82f6', borderWidth: 1.5, pointRadius: 0,
+          fill: { target: 'origin', above: 'rgba(59,130,246,0.06)' }, tension: 0.3 },
+        { data: [], borderColor: 'rgba(245,158,11,0.4)', borderWidth: 1,
+          pointRadius: 0, borderDash: [5, 5], fill: false },
+      ]
+    },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        y: { min: 0.08, max: 0.38,
+             grid: { color: 'rgba(255,255,255,0.04)' },
+             ticks: { color: '#6b7280', font: { family: 'Space Mono', size: 9 } } },
+        x: { display: false }
+      }
+    }
+  });
+}
+
+// ── Toast ──────────────────────────────────────────────────────────────────
+let _toastEl;
+function toast(msg) {
+  if (_toastEl) { _toastEl.classList.add('out'); setTimeout(() => _toastEl && _toastEl.remove(), 300); }
+  _toastEl = document.createElement('div');
+  _toastEl.className = 'toast';
+  _toastEl.textContent = msg;
+  document.body.appendChild(_toastEl);
+  setTimeout(() => {
+    if (_toastEl) { _toastEl.classList.add('out'); setTimeout(() => _toastEl && _toastEl.remove(), 300); }
+  }, 2800);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('detect-feed').style.display = 'none';
+  document.getElementById('calib-feed').style.display = 'none';
+  setTimeout(initChart, 100);
+});
+
+function showAnalytics(session) {
+
+  console.log("SESSION DATA:", session);
+  console.log("EAR length:", session.ear_series.length);
+
+  if (!session.ear_series || session.ear_series.length === 0) {
+    toast("No EAR data for this session");
+    return;
+  }
+
+  const container = document.getElementById('analyticsContainer');
+
+
+  const canvas = document.getElementById('analyticsChart');
+  const ctx = canvas.getContext('2d');
+
+  window.analyticsChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: session.ear_series.map((_, i) => i),
+      datasets: [
+        {
+          label: 'EAR',
+          data: session.ear_series,
+          borderColor: '#3b82f6',
+          borderWidth: 2,
+          tension: 0.3,
+          pointRadius: 0
+        },
+        {
+          label: 'Threshold',
+          data: Array(session.ear_series.length).fill(session.threshold),
+          borderColor: 'orange',
+          borderDash: [5,5],
+          borderWidth: 2,
+          pointRadius: 0
+        },
+        {
+          label: 'Alarms',
+          data: session.ear_series.map((v, i) => 
+            v < session.threshold ? v : null
+          ),
+          pointBackgroundColor: 'red',
+          pointRadius: 4,
+          showLine: false
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: {
+        legend: { display: true }
+      },
+      scales: {
+        y: {
+          min: 0.1,
+          max: 0.4
+        }
+      }
+    }
+  });
+
+  console.log("✅ FORCED chart render");
+}
+
+function openSession(s) {
+  showAnalytics(s);
+}
+</script>
+</body>
+</html>
