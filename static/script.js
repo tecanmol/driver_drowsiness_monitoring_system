@@ -1,296 +1,630 @@
-const user = localStorage.getItem('user') || "driver1";
-// ── Socket.IO connection ───────────────────────────────────────────────────
-const socket = io();
-
+// ══ STATE ════════════════════════════════════════════════════════
+let token = localStorage.getItem('dg_token');
+let currentUser = null;
+let socket = null;
 let running = false;
-let currentThreshold = 0.16;
 let earBuf = [];
-let prevEAR = null;
-// ── Connection state ──
-socket.on('connect', () => {
-  setBanner('ok', '✓ Connected to backend');
-  socket.emit('load_user', { user });
-  setTimeout(() => setBanner('hidden', ''), 2000);
-  document.getElementById('main-btn').disabled = false;
-  document.getElementById('calib-btn').disabled = false;
-  document.getElementById('sys-dot').style.background = 'var(--green)';
-});
+let currentThreshold = 0.17;
+let selectedRole = 'driver';
+let sessionChartInst = null;
+let driverCards = {};  // username -> card data
+let alertCount = 0;
+let allSessions = [];
+let allDrivers = [];
 
-socket.on('user_loaded', (d) => {
-  currentThreshold = d.threshold;
+// ══ AUTH ═════════════════════════════════════════════════════════
+function switchAuthTab(tab) {
+  document.getElementById('form-login').classList.toggle('hidden', tab !== 'login');
+  document.getElementById('form-signup').classList.toggle('hidden', tab !== 'signup');
+  document.getElementById('tab-login').classList.toggle('active', tab === 'login');
+  document.getElementById('tab-signup').classList.toggle('active', tab !== 'login');
+}
 
-  document.getElementById('thr-label').textContent =
-    'threshold ' + d.threshold.toFixed(3);
-});
+function selectRole(r) {
+  selectedRole = r;
+  document.getElementById('role-driver').classList.toggle('active', r === 'driver');
+  document.getElementById('role-admin').classList.toggle('active', r === 'admin');
+}
 
-socket.on('disconnect', () => {
-  setBanner('warn', '⚡ Disconnected — is server.py running?');
-  document.getElementById('sys-dot').style.background = 'var(--red)';
-  document.getElementById('main-btn').disabled = true;
-  document.getElementById('calib-btn').disabled = true;
-});
+async function doLogin() {
+  const username = document.getElementById('login-user').value.trim();
+  const password = document.getElementById('login-pass').value;
+  const errEl = document.getElementById('login-error');
 
-socket.on('error', (d) => toast('Error: ' + d.msg));
-
-// ── Detection ──
-socket.on('started', () => {
-  running = true;
-  earBuf = [];
-  document.getElementById('main-btn').textContent = '⏹  Stop Detection';
-  document.getElementById('main-btn').className   = 'btn stop';
-  const label = document.getElementById('cam-label');
-  if (label) label.textContent = 'Camera active';
-  document.getElementById('sys-dot').style.background = 'var(--amber)';
-  document.getElementById('detect-feed').style.display = 'block';
-});
-
-socket.on('frame', (d) => {
-  currentThreshold = d.threshold;
-
-  earBuf.push(d.ear);
-  if (earBuf.length > 300) earBuf.shift();
-
-  // EAR number + colour
-  const n = document.getElementById('ear-num');
-  n.textContent = d.ear.toFixed(3);
-  n.className = 'ear-num ' + (d.ear < d.threshold ? 'bad' : d.ear < d.threshold + 0.03 ? 'warn' : 'ok');
-
-  // State pill
-  document.getElementById('state-pill-wrap').innerHTML = d.status === 'drowsy'
-    ? '<span class="state-pill drowsy"><span class="dot"></span>DROWSY</span>'
-    : '<span class="state-pill alert"><span class="dot"></span>ALERT</span>';
-
-  // Threshold label
-  document.getElementById('thr-label').textContent = 'threshold ' + d.threshold.toFixed(3);
-
-  // 3-second filter bar
-  document.getElementById('frame-fill').style.width = (d.drowsy_frames / 45 * 100) + '%';
-  document.getElementById('frame-ct').textContent = d.drowsy_frames + ' / 45';
-
-  // Stats
-  document.getElementById('alarm-ct').textContent = d.alarms;
-  document.getElementById('fps-stat').textContent  = d.fps;
-
-  // Runtime
-  const secs = d.runtime;
-  const m = Math.floor(secs / 60), s = secs % 60;
-  document.getElementById('runtime').textContent =
-    String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
-
-  // Mean EAR
-  const mean = earBuf.reduce((a, b) => a + b, 0) / earBuf.length;
-  document.getElementById('mean-ear').textContent = 'mean ' + mean.toFixed(3);
-
-  // Chart
-  if (window.earChart && window.earChart.data) {
-    window.earChart.data.datasets[0].data = earBuf.slice();
-    window.earChart.data.datasets[1].data = Array(earBuf.length).fill(d.threshold);
-    window.earChart.data.labels = earBuf.map(() => '');
-    window.earChart.update('none');
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ username, password })
+    });
+    const data = await res.json();
+    if (!res.ok) { errEl.textContent = data.error; errEl.classList.remove('hidden'); return; }
+    errEl.classList.add('hidden');
+    initSession(data);
+  } catch(e) {
+    errEl.textContent = 'Cannot connect to server. Is server.py running?';
+    errEl.classList.remove('hidden');
   }
+}
 
-// ── TREND LOGIC (FINAL FIX) ──
-let trend = "—";
+async function doSignup() {
+  const name = document.getElementById('signup-name').value.trim();
+  const username = document.getElementById('signup-user').value.trim();
+  const password = document.getElementById('signup-pass').value;
+  const errEl = document.getElementById('signup-error');
 
-if (earBuf.length > 10) {
-  const recent = earBuf.slice(-10);
+  try {
+    const res = await fetch('/api/signup', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ name, username, password, role: selectedRole })
+    });
+    const data = await res.json();
+    if (!res.ok) { errEl.textContent = data.error; errEl.classList.remove('hidden'); return; }
+    errEl.classList.add('hidden');
+    initSession(data);
+  } catch(e) {
+    errEl.textContent = 'Cannot connect to server. Is server.py running?';
+    errEl.classList.remove('hidden');
+  }
+}
 
-  const firstAvg = recent.slice(0, 5).reduce((a,b)=>a+b,0)/5;
-  const lastAvg  = recent.slice(5).reduce((a,b)=>a+b,0)/5;
+function initSession(data) {
+  token = data.token;
+  currentUser = data;
+  localStorage.setItem('dg_token', token);
+  localStorage.setItem('dg_user', JSON.stringify(data));
+  showApp();
+}
 
-  if (lastAvg > firstAvg + 0.002) {
-    trend = "↑ improving";
-  } else if (lastAvg < firstAvg - 0.002) {
-    trend = "↓ drowsy";
+function doLogout() {
+  localStorage.removeItem('dg_token');
+  localStorage.removeItem('dg_user');
+  if (socket) socket.disconnect();
+  location.reload();
+}
+
+// ══ APP INIT ═════════════════════════════════════════════════════
+function showApp() {
+  document.getElementById('auth-screen').style.display = 'none';
+  document.getElementById('app-screen').classList.add('show');
+
+  const u = currentUser;
+  document.getElementById('user-name-hdr').textContent = u.name || u.username;
+  document.getElementById('user-avatar-hdr').textContent = (u.name || u.username)[0].toUpperCase();
+  document.getElementById('role-badge').textContent = u.role.toUpperCase();
+
+  const roleTag = document.getElementById('user-role-tag');
+  roleTag.textContent = u.role.toUpperCase();
+  roleTag.className = `role-tag ${u.role}`;
+
+  buildNav(u.role);
+
+  if (u.role === 'admin') {
+    document.getElementById('admin-pages').classList.remove('hidden');
+    initAdminSocket();
+    loadAdminFleet();
   } else {
-    trend = "→ stable";
+    document.getElementById('driver-pages').classList.remove('hidden');
+    currentThreshold = u.threshold || 0.17;
+    if (!u.calibrated) {
+      document.getElementById('calib-notice').classList.remove('hidden');
+    }
+    updateCalibStatus(u.calibrated, u.threshold);
+    initDriverSocket();
+    setTimeout(initChart, 100);
   }
 }
 
-console.log("TREND:", trend); // debug
-
-const trendEl = document.getElementById('ear-trend');
-trendEl.textContent = trend;
-
-if (trend.includes("↑")) {
-  trendEl.style.color = "var(--green)";
-} else if (trend.includes("↓")) {
-  trendEl.style.color = "var(--red)";
-} else {
-  trendEl.style.color = "var(--muted)";
+function buildNav(role) {
+  const nav = document.getElementById('main-nav');
+  if (role === 'admin') {
+    nav.innerHTML = `
+      <button class="nav-btn active" onclick="showPage('fleet')">Fleet</button>
+      <button class="nav-btn" onclick="showPage('admin-sessions');loadAdminSessions()">Sessions</button>
+    `;
+  } else {
+    nav.innerHTML = `
+      <button class="nav-btn active" onclick="showPage('detect')">Detect</button>
+      <button class="nav-btn" onclick="showPage('calibrate')">Calibrate</button>
+      <button class="nav-btn" onclick="showPage('sessions');loadDriverSessions()">Sessions</button>
+    `;
+  }
 }
-});
 
-socket.on('stopped', (d) => {
-  running = false;
-  document.getElementById('main-btn').textContent = '▶  Start Detection';
-  document.getElementById('main-btn').className   = 'btn start';
-  const label = document.getElementById('cam-label');
-  if (label) label.textContent = 'Camera active';
-  document.getElementById('sys-dot').style.background = 'var(--green)';
-  document.getElementById('detect-feed').style.display = 'none';
-  setIdle();
-
-  // Save session
-  const alertFrames = earBuf.filter(e => e >= currentThreshold).length;
-  const alertPct    = earBuf.length ? Math.round(alertFrames / earBuf.length * 100) : 100;
-  const meanEar     = earBuf.length ? +(earBuf.reduce((a, b) => a + b, 0) / earBuf.length).toFixed(3) : 0;
-  socket.emit('save_session', {
-    runtime: d.runtime, alarms: d.alarms,
-    mean_ear: meanEar, threshold: currentThreshold, alert_pct: alertPct,
-    ear_series: earBuf
-  });
-
-  toast('Session ended — ' + d.alarms + ' alarm' + (d.alarms !== 1 ? 's' : ''));
-});
-
-// ── Calibration ──
-socket.on('calib_progress', (d) => {
-  const total = 408;
-  document.getElementById('ring').style.strokeDashoffset = total - (total * d.progress / 100);
-  document.getElementById('calib-pct').textContent = d.progress + '%';
-  document.getElementById('calib-sub').textContent  = 'collecting';
-});
-
-socket.on('calibrated', (d) => {
-  currentThreshold = d.threshold;
-
-  document.getElementById('ring').style.strokeDashoffset = 0;
-  document.getElementById('calib-pct').textContent = '✓';
-  document.getElementById('calib-sub').textContent = 'done';
-  document.getElementById('calib-result').style.display = 'flex';
-  document.getElementById('calib-val').textContent = d.threshold.toFixed(3);
-  document.getElementById('calib-feed').style.display = 'none';
-
-  toast('Calibration complete');
-  socket.emit('save_user_threshold', {
-    user,
-    threshold: d.threshold
-  });
-  // 🛑 STOP detection after calibration
-  socket.emit('stop');
-});
-
-// ── Sessions ──
-socket.on('sessions', renderSessions);
-
-// ── UI helpers ─────────────────────────────────────────────────────────────
-function show(id) {
+function showPage(id) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
-
-  document.getElementById('page-' + id).classList.add('active');
-
-  // 🔥 IMPORTANT FIX
-  if (id !== 'detect') {
-    document.getElementById('detect-feed').style.display = 'none';
-  }
-  if (id !== 'calibrate') {
-    document.getElementById('calib-feed').style.display = 'none';
-  }
-
+  const page = document.getElementById('page-' + id);
+  if (page) page.classList.add('active');
   document.querySelectorAll('.nav-btn').forEach(b => {
-    if (b.textContent.toLowerCase().includes(id.slice(0, 4))) {
-      b.classList.add('active');
-    }
+    if (b.textContent.toLowerCase().includes(id.slice(0,4).toLowerCase())) b.classList.add('active');
+  });
+  if (id === 'detect') setTimeout(initChart, 50);
+  // Hide feeds when not on their page
+  if (id !== 'detect') document.getElementById('detect-feed').style.display = 'none';
+  if (id !== 'calibrate') document.getElementById('calib-feed').style.display = 'none';
+}
+
+// ══ DRIVER SOCKET ════════════════════════════════════════════════
+function initDriverSocket() {
+  socket = io();
+
+  socket.on('connect', () => {
+    setBanner('ok', '✓ Connected');
+    setTimeout(() => setBanner('hidden', ''), 2000);
+    document.getElementById('main-btn').disabled = false;
+    document.getElementById('calib-btn').disabled = false;
+    socket.emit('auth', { token });
   });
 
-  if (id === 'detect') setTimeout(initChart, 50);
-}
+  socket.on('auth_ok', (d) => {
+    currentThreshold = d.threshold || 0.17;
+    document.getElementById('thr-label').textContent = 'threshold ' + currentThreshold.toFixed(3);
+    updateCalibStatus(d.calibrated, d.threshold);
+  });
 
-function setBanner(type, msg) {
-  const el = document.getElementById('conn-banner');
-  el.className = 'conn-banner' + (type === 'hidden' ? ' hidden' : type === 'ok' ? ' ok' : '');
-  el.innerHTML = msg;
-}
+  socket.on('auth_error', (d) => toast(d.msg, 'warn'));
 
-function setIdle() {
-  document.getElementById('ear-num').textContent = '—';
-  document.getElementById('ear-num').className   = 'ear-num ok';
-  document.getElementById('state-pill-wrap').innerHTML =
-    '<span class="state-pill idle"><span class="dot"></span>IDLE</span>';
-  document.getElementById('frame-fill').style.width = '0%';
-  document.getElementById('frame-ct').textContent   = '0 / 45';
-  document.getElementById('thr-label').textContent  = '— waiting —';
-  document.getElementById('fps-stat').textContent   = '—';
+  socket.on('disconnect', () => {
+    setBanner('warn', '⚡ Disconnected — is server.py running?');
+    document.getElementById('main-btn').disabled = true;
+    document.getElementById('calib-btn').disabled = true;
+  });
+
+  socket.on('error', (d) => toast('Error: ' + d.msg, 'warn'));
+
+  socket.on('started', () => {
+    running = true;
+    earBuf = [];
+    document.getElementById('main-btn').textContent = '⏹ Stop Detection';
+    document.getElementById('main-btn').className = 'btn stop';
+    document.getElementById('detect-feed').style.display = 'block';
+    document.getElementById('cam-placeholder').style.display = 'none';
+    document.getElementById('cam-status').classList.remove('hidden');
+  });
+
+  socket.on('frame', (d) => {
+    currentThreshold = d.threshold;
+    earBuf.push(d.ear);
+    if (earBuf.length > 300) earBuf.shift();
+
+    const n = document.getElementById('ear-num');
+    n.textContent = d.ear.toFixed(3);
+    n.className = 'ear-num ' + (d.ear < d.threshold ? 'bad' : d.ear < d.threshold + 0.03 ? 'warn' : 'ok');
+
+    document.getElementById('state-pill-wrap').innerHTML = d.status === 'drowsy'
+      ? '<span class="state-pill drowsy"><span class="dot"></span>DROWSY</span>'
+      : '<span class="state-pill alert"><span class="dot"></span>ALERT</span>';
+
+    document.getElementById('thr-label').textContent = 'threshold ' + d.threshold.toFixed(3);
+    document.getElementById('frame-fill').style.width = (d.drowsy_frames / 45 * 100) + '%';
+    document.getElementById('frame-ct').textContent = d.drowsy_frames + ' / 45';
+    document.getElementById('alarm-ct').textContent = d.alarms;
+    document.getElementById('fps-stat').textContent = d.fps;
+
+    const secs = d.runtime;
+    document.getElementById('runtime').textContent =
+      String(Math.floor(secs/60)).padStart(2,'0') + ':' + String(secs%60).padStart(2,'0');
+
+    const mean = earBuf.reduce((a,b)=>a+b,0)/earBuf.length;
+    document.getElementById('mean-ear').textContent = 'mean ' + mean.toFixed(3);
+
+    updateChart(d);
+    updateTrend();
+  });
+
+  socket.on('stopped', (d) => {
+    running = false;
+    document.getElementById('main-btn').textContent = '▶ Start Detection';
+    document.getElementById('main-btn').className = 'btn start';
+    document.getElementById('detect-feed').style.display = 'none';
+    document.getElementById('cam-placeholder').style.display = 'flex';
+    document.getElementById('cam-status').classList.add('hidden');
+    setIdle();
+
+    const alertFrames = earBuf.filter(e => e >= currentThreshold).length;
+    const alertPct = earBuf.length ? Math.round(alertFrames / earBuf.length * 100) : 100;
+    const meanEar = earBuf.length ? +(earBuf.reduce((a,b)=>a+b,0)/earBuf.length).toFixed(3) : 0;
+
+    socket.emit('save_session', {
+      token, runtime: d.runtime, alarms: d.alarms,
+      mean_ear: meanEar, threshold: currentThreshold,
+      alert_pct: alertPct, ear_series: earBuf,
+      clips: d.clips || [],
+    });
+
+    toast('Session saved — ' + d.alarms + ' alarm' + (d.alarms !== 1 ? 's' : ''));
+  });
+
+  socket.on('calib_progress', (d) => {
+    const total = 408;
+    document.getElementById('ring').style.strokeDashoffset = total - (total * d.progress / 100);
+    document.getElementById('calib-pct').textContent = d.progress + '%';
+    document.getElementById('calib-sub').textContent = 'collecting';
+  });
+
+  socket.on('calibrated', (d) => {
+    currentThreshold = d.threshold;
+    document.getElementById('ring').style.strokeDashoffset = 0;
+    document.getElementById('calib-pct').textContent = '✓';
+    document.getElementById('calib-sub').textContent = 'done';
+    document.getElementById('calib-result').classList.remove('hidden');
+    document.getElementById('calib-val').textContent = d.threshold.toFixed(3);
+    document.getElementById('calib-feed').style.display = 'none';
+    document.getElementById('calib-cam-placeholder').style.display = 'flex';
+    document.getElementById('calib-notice').classList.add('hidden');
+    updateCalibStatus(true, d.threshold);
+    // update stored user
+    const saved = JSON.parse(localStorage.getItem('dg_user') || '{}');
+    saved.calibrated = true;
+    saved.threshold = d.threshold;
+    localStorage.setItem('dg_user', JSON.stringify(saved));
+    toast('Calibration complete — threshold: ' + d.threshold.toFixed(3));
+    socket.emit('stop');
+  });
+
+  socket.on('sessions', renderDriverSessions);
+  socket.on('session_saved', (s) => { /* saved confirmation */ });
 }
 
 function toggleDetect() {
-  if (!running) socket.emit('start');
-  else          socket.emit('stop');
+  if (!running) socket.emit('start', { token });
+  else socket.emit('stop');
 }
 
 function startCalib() {
-  // Always stop detection first
+  // hide confirm dialog if visible
+  document.getElementById('recalib-confirm').classList.add('hidden');
   socket.emit('stop');
-
-  // Reset UI
   document.getElementById('calib-pct').textContent = '0%';
   document.getElementById('calib-sub').textContent = 'collecting';
   document.getElementById('ring').style.strokeDashoffset = '408';
-  document.getElementById('calib-result').style.display = 'none';
-
-  // Start backend (will auto-calibrate first)
+  document.getElementById('calib-result').classList.add('hidden');
   setTimeout(() => {
-    socket.emit('start');
+    socket.emit('start', { token });
     document.getElementById('calib-feed').style.display = 'block';
+    document.getElementById('calib-cam-placeholder').style.display = 'none';
   }, 500);
 }
 
-function loadSessions() { socket.emit('get_sessions'); }
-
-function renderSessions(data) {
-  const list  = document.getElementById('session-list');
-  const count = document.getElementById('sessions-count');
-  if (!data || !data.length) {
-    list.innerHTML  = '<div class="empty">No sessions yet — start detecting to record one.</div>';
-    count.textContent = '0 sessions';
-    return;
-  }
-  count.textContent = data.length + ' session' + (data.length !== 1 ? 's' : '');
-  list.innerHTML = data.map(s => {
-    const sec = s.duration || 0;
-    const h   = Math.floor(sec / 3600);
-    const m   = Math.floor((sec % 3600) / 60);
-    const sc  = sec % 60;
-    const dur = (h > 0 ? h + 'h ' : '') + m + 'm ' + sc + 's';
-    const ok  = (s.alert_pct || 0) >= 90;
-    const col = s.alarms > 10 ? 'var(--red)' : s.alarms > 3 ? 'var(--amber)' : 'var(--green)';
-    return `
-      <div class="session-item" onclick='openSession(${JSON.stringify(s)})'>
-          ${s.clip ? `
-          <img src="/${s.clip}" width="180" style="margin-top:6px;border-radius:6px"/>
-        ` : ''}
-        <div class="session-dot" style="background:${ok ? 'var(--green)' : 'var(--red)'}"></div>
-        <div class="session-main">
-          <div class="session-time">${s.date}</div>
-          <div class="session-dur">${dur}</div>
-        </div>
-        <div style="text-align:right">
-          <div class="session-pct" style="color:${col}">${s.alarms} alarm${s.alarms !== 1 ? 's' : ''}</div>
-          <div class="session-pct">${s.alert_pct || 0}% alert</div>
-        </div>
-      </div>`;
-  }).join('');
+function confirmRecalib() {
+  document.getElementById('recalib-confirm').classList.remove('hidden');
 }
 
-function exportCSV() {
-  socket.emit('get_sessions');
-  socket.once('sessions', (data) => {
-    if (!data.length) { toast('No sessions to export'); return; }
-    const rows = ['Date,Duration (s),Alarms,Alert %,Mean EAR,Threshold']
-      .concat(data.map(s => `${s.date},${s.duration},${s.alarms},${s.alert_pct},${s.mean_ear},${s.threshold}`))
-      .join('\n');
-    const a = Object.assign(document.createElement('a'), {
-      href: URL.createObjectURL(new Blob([rows], { type: 'text/csv' })),
-      download: 'sessions.csv',
-    });
-    a.click();
-    toast('Exported sessions.csv');
+function cancelRecalib() {
+  document.getElementById('recalib-confirm').classList.add('hidden');
+}
+
+function updateCalibStatus(calibrated, threshold) {
+  const thr = threshold || 0.17;
+  document.getElementById('current-thr-val').textContent = thr.toFixed(3);
+  document.getElementById('current-calib-badge').classList.toggle('hidden', !calibrated);
+  document.getElementById('default-calib-badge').classList.toggle('hidden', calibrated);
+  // show recalibrate button only if already calibrated
+  document.getElementById('recalib-btn').classList.toggle('hidden', !calibrated);
+  // if calibrated, hide the main "Begin Calibration" button (use recalibrate flow instead)
+  const calibBtn = document.getElementById('calib-btn');
+  calibBtn.style.display = calibrated ? 'none' : 'block';
+}
+
+function loadDriverSessions() {
+  socket.emit('get_sessions', { token });
+}
+
+// ══ ADMIN SOCKET ═════════════════════════════════════════════════
+function initAdminSocket() {
+  socket = io();
+
+  socket.on('connect', () => {
+    socket.emit('auth', { token });
+    socket.emit('admin_join', { token });
+  });
+
+  socket.on('auth_ok', () => {});
+
+  socket.on('driver_alert', (d) => {
+    alertCount++;
+    document.getElementById('stat-alerts').textContent = alertCount;
+    addAlertFeedItem(d);
+    toast('🚨 DROWSY: ' + d.driver + ' at ' + d.timestamp, 'warn');
+    const card = driverCards[d.driver];
+    if (card) {
+      card.classList.add('drowsy');
+      card.classList.remove('active');
+      setTimeout(() => {
+        card.classList.remove('drowsy');
+        card.classList.add('active');
+      }, 10000);
+    }
+  });
+
+  socket.on('driver_status', (d) => {
+    updateDriverCard(d.driver, d);
+  });
+
+  socket.on('active_drivers', (list) => {
+    // mark active
+    list.forEach(d => updateDriverCard(d.driver, d));
+  });
+
+  socket.on('sessions', renderAdminSessions);
+}
+
+async function loadAdminFleet() {
+  try {
+    const res = await fetch('/api/drivers', { headers: {'Authorization': 'Bearer ' + token} });
+    if (!res.ok) return;
+    allDrivers = await res.json();
+    document.getElementById('stat-total').textContent = allDrivers.length;
+    document.getElementById('stat-active').textContent = '0';
+    renderFleetGrid(allDrivers);
+  } catch(e) {}
+
+  // sessions count
+  try {
+    const res2 = await fetch('/api/sessions', { headers: {'Authorization': 'Bearer ' + token} });
+    if (res2.ok) {
+      allSessions = await res2.json();
+      const today = new Date().toISOString().slice(0,10);
+      const todayCount = allSessions.filter(s => s.date && s.date.startsWith(today)).length;
+      document.getElementById('stat-sessions').textContent = todayCount;
+    }
+  } catch(e) {}
+}
+
+function loadAdminSessions() {
+  socket.emit('get_sessions', { token });
+}
+
+function renderFleetGrid(drivers) {
+  const grid = document.getElementById('fleet-grid');
+  if (!drivers.length) {
+    grid.innerHTML = '<div class="empty">No drivers registered yet.</div>';
+    return;
+  }
+  grid.innerHTML = '';
+  drivers.forEach(d => {
+    const card = document.createElement('div');
+    card.className = 'driver-card';
+    card.id = 'dcard-' + d.username;
+    card.innerHTML = `
+      <div class="dc-header">
+        <div class="dc-avatar">${(d.name||d.username)[0].toUpperCase()}</div>
+        <div>
+          <div class="dc-name">${d.name||d.username}</div>
+          <div class="dc-username">@${d.username}</div>
+        </div>
+        <div class="dc-status offline" id="dcstatus-${d.username}">
+          <div class="dot"></div>
+          <span>Offline</span>
+        </div>
+      </div>
+      <div class="dc-stat-row">
+        <div class="dc-stat">
+          <div class="dc-stat-label">EAR</div>
+          <div class="dc-stat-val mono" id="dcear-${d.username}" style="color:var(--muted)">—</div>
+        </div>
+        <div class="dc-stat">
+          <div class="dc-stat-label">Status</div>
+          <div class="dc-stat-val" id="dcstate-${d.username}" style="color:var(--muted);font-size:13px">Offline</div>
+        </div>
+        <div class="dc-stat">
+          <div class="dc-stat-label">Alarms</div>
+          <div class="dc-stat-val" id="dcalarm-${d.username}" style="color:var(--muted)">—</div>
+        </div>
+      </div>
+      <div class="dc-threshold">
+        <span>Threshold</span>
+        <span class="mono">${d.calibrated ? d.threshold.toFixed(3) : 'not calibrated'}</span>
+      </div>`;
+    driverCards[d.username] = card;
+    grid.appendChild(card);
   });
 }
 
-// ── Chart ──────────────────────────────────────────────────────────────────
+function updateDriverCard(username, data) {
+  const card = driverCards[username];
+  if (!card) return;
+
+  const statusEl = document.getElementById('dcstatus-' + username);
+  const earEl = document.getElementById('dcear-' + username);
+  const stateEl = document.getElementById('dcstate-' + username);
+  const alarmEl = document.getElementById('dcalarm-' + username);
+
+  const isDrowsy = data.status === 'drowsy';
+
+  if (statusEl) {
+    statusEl.className = 'dc-status ' + (isDrowsy ? 'drowsy' : 'online');
+    statusEl.innerHTML = `<div class="dot"></div><span>${isDrowsy ? 'DROWSY' : 'Active'}</span>`;
+  }
+  if (earEl) {
+    earEl.textContent = typeof data.ear === 'number' ? data.ear.toFixed(3) : '—';
+    earEl.style.color = isDrowsy ? 'var(--red)' : 'var(--green)';
+  }
+  if (stateEl) {
+    stateEl.textContent = (data.status || 'Offline').toUpperCase();
+    stateEl.style.color = isDrowsy ? 'var(--red)' : 'var(--green)';
+  }
+  if (alarmEl) {
+    alarmEl.textContent = data.alarms ?? '—';
+    alarmEl.style.color = data.alarms > 0 ? 'var(--red)' : 'var(--muted)';
+  }
+
+  card.classList.toggle('active', !isDrowsy);
+  card.classList.toggle('drowsy', isDrowsy);
+
+  // Update active count
+  const activeCards = document.querySelectorAll('.driver-card.active, .driver-card.drowsy');
+  document.getElementById('stat-active').textContent = activeCards.length;
+}
+
+function addAlertFeedItem(d) {
+  const feed = document.getElementById('alert-feed');
+  const empty = feed.querySelector('.empty');
+  if (empty) empty.remove();
+
+  const item = document.createElement('div');
+  item.className = 'alert-item';
+  item.innerHTML = `
+    <div class="alert-icon">🚨</div>
+    <div style="flex:1">
+      <div class="alert-driver">${d.driver}</div>
+      <div style="font-size:12px;color:var(--sub)">EAR: ${d.ear}</div>
+    </div>
+    ${d.clip ? `<img src="/clips/${d.clip}" style="height:48px;border-radius:4px;border:1px solid var(--border);cursor:pointer" title="Click to enlarge" onclick="window.open('/clips/${d.clip}','_blank')" onerror="this.remove()" />` : ''}
+    <div class="alert-time">${d.timestamp}</div>`;
+  feed.insertBefore(item, feed.firstChild);
+
+  // Keep max 20
+  const items = feed.querySelectorAll('.alert-item');
+  if (items.length > 20) items[items.length - 1].remove();
+}
+
+// ══ SESSIONS ═════════════════════════════════════════════════════
+function renderDriverSessions(data) {
+  const list = document.getElementById('session-list');
+  const count = document.getElementById('sessions-count');
+  allSessions = data;
+
+  if (!data || !data.length) {
+    list.innerHTML = '<div class="empty">No sessions yet — start detecting to record one.</div>';
+    count.textContent = '0 sessions';
+    return;
+  }
+
+  count.textContent = data.length + ' session' + (data.length !== 1 ? 's' : '');
+  list.innerHTML = data.map(s => sessionHTML(s, false)).join('');
+}
+
+function renderAdminSessions(data) {
+  const list = document.getElementById('admin-session-list');
+  const count = document.getElementById('admin-sessions-count');
+  allSessions = data;
+
+  if (!data || !data.length) {
+    list.innerHTML = '<div class="empty">No sessions recorded yet.</div>';
+    count.textContent = '0 sessions';
+    return;
+  }
+
+  count.textContent = data.length + ' session' + (data.length !== 1 ? 's' : '');
+  list.innerHTML = data.map(s => sessionHTML(s, true)).join('');
+}
+
+function sessionHTML(s, showDriver) {
+  const sec = s.duration || 0;
+  const h = Math.floor(sec/3600);
+  const m = Math.floor((sec%3600)/60);
+  const sc = sec % 60;
+  const dur = (h > 0 ? h+'h ' : '') + m+'m ' + sc+'s';
+  const ok = (s.alert_pct || 0) >= 90;
+  const col = s.alarms > 10 ? 'var(--red)' : s.alarms > 3 ? 'var(--amber)' : 'var(--green)';
+  const driverLine = showDriver ? `<div class="session-driver">@${s.driver || '—'}</div>` : '';
+
+  return `<div class="session-item" onclick='openSession(${JSON.stringify(s)})'>
+    <div class="session-dot" style="background:${ok?'var(--green)':'var(--red)'}"></div>
+    <div class="session-main">
+      ${driverLine}
+      <div class="session-time">${s.date}</div>
+      <div class="session-dur">${dur}</div>
+    </div>
+    <div class="session-right">
+      <div class="session-alarms" style="color:${col}">${s.alarms} alarm${s.alarms!==1?'s':''}</div>
+      <div class="session-pct">${s.alert_pct||0}% alert</div>
+    </div>
+  </div>`;
+}
+
+function openSession(s) {
+  const m = document.getElementById('session-modal');
+  m.classList.remove('hidden');
+
+  document.getElementById('modal-title').textContent = s.driver
+    ? `Session — @${s.driver} on ${s.date}`
+    : `Session — ${s.date}`;
+
+  const sec = s.duration || 0;
+  document.getElementById('modal-dur').textContent =
+    Math.floor(sec/60) + 'm ' + (sec%60) + 's';
+  document.getElementById('modal-alarms').textContent = s.alarms ?? '—';
+  document.getElementById('modal-pct').textContent = (s.alert_pct ?? 100) + '%';
+
+  // Render clips
+  const clipsWrap = document.getElementById('modal-clips');
+  const clips = s.clips || (s.clip ? [s.clip] : []);
+  if (clips.length) {
+    clipsWrap.innerHTML = `
+      <div style="font-size:11px;color:var(--sub);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">
+        Drowsiness Captures (${clips.length})
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;">
+        ${clips.map((c, i) => `
+          <div style="position:relative;">
+            <img src="/clips/${c}" title="Event ${i+1}"
+              style="height:90px;border-radius:6px;border:1px solid var(--border);cursor:pointer;background:#000"
+              onerror="this.style.display='none'"
+              onclick="window.open('/clips/${c}','_blank')" />
+            <div style="position:absolute;bottom:4px;left:4px;background:rgba(0,0,0,0.65);border-radius:3px;padding:1px 5px;font-size:10px;font-family:var(--mono);color:#fff">
+              #${i+1}
+            </div>
+          </div>`).join('')}
+      </div>`;
+    clipsWrap.style.display = 'block';
+  } else {
+    clipsWrap.innerHTML = '';
+    clipsWrap.style.display = 'none';
+  }
+
+  // Destroy old chart
+  if (sessionChartInst) { sessionChartInst.destroy(); sessionChartInst = null; }
+
+  const ctx = document.getElementById('session-chart');
+  if (s.ear_series && s.ear_series.length) {
+    sessionChartInst = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: s.ear_series.map((_,i) => i),
+        datasets: [
+          { label: 'EAR', data: s.ear_series, borderColor: '#2979ff', borderWidth: 2, tension: 0.3, pointRadius: 0, fill: { target: 'origin', above: 'rgba(41,121,255,0.05)' } },
+          { label: 'Threshold', data: Array(s.ear_series.length).fill(s.threshold||0.17), borderColor: '#ffab00', borderDash: [5,5], borderWidth: 1.5, pointRadius: 0, fill: false },
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          y: { min: 0.08, max: 0.4, grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#4a5068', font: { family: 'JetBrains Mono', size: 9 } } },
+          x: { display: false }
+        }
+      }
+    });
+  } else {
+    ctx.getContext('2d').clearRect(0, 0, ctx.width, ctx.height);
+  }
+}
+
+function closeSessionModal() {
+  document.getElementById('session-modal').classList.add('hidden');
+}
+
+function closeModal(e) {
+  if (e.target === document.getElementById('session-modal')) closeSessionModal();
+}
+
+// ══ CSV EXPORT ═══════════════════════════════════════════════════
+function exportCSV() {
+  if (!allSessions.length) { toast('No sessions to export'); return; }
+  const rows = ['Date,Driver,Duration (s),Alarms,Alert %,Mean EAR,Threshold']
+    .concat(allSessions.map(s => `${s.date},${s.driver||'—'},${s.duration},${s.alarms},${s.alert_pct},${s.mean_ear},${s.threshold}`))
+    .join('\n');
+  const a = Object.assign(document.createElement('a'), {
+    href: URL.createObjectURL(new Blob([rows], {type:'text/csv'})),
+    download: 'drowseguard-sessions.csv',
+  });
+  a.click();
+  toast('Exported sessions.csv');
+}
+
+// ══ CHART ════════════════════════════════════════════════════════
 function initChart() {
   const ctx = document.getElementById('earChart');
   if (!ctx || window.earChart) return;
@@ -299,111 +633,84 @@ function initChart() {
     data: {
       labels: [],
       datasets: [
-        { data: [], borderColor: '#3b82f6', borderWidth: 1.5, pointRadius: 0,
-          fill: { target: 'origin', above: 'rgba(59,130,246,0.06)' }, tension: 0.3 },
-        { data: [], borderColor: 'rgba(245,158,11,0.4)', borderWidth: 1,
-          pointRadius: 0, borderDash: [5, 5], fill: false },
+        { data: [], borderColor: '#2979ff', borderWidth: 1.5, pointRadius: 0, fill: { target: 'origin', above: 'rgba(41,121,255,0.06)' }, tension: 0.3 },
+        { data: [], borderColor: 'rgba(255,171,0,0.5)', borderWidth: 1, pointRadius: 0, borderDash: [5,5], fill: false },
       ]
     },
     options: {
       animation: false, responsive: true, maintainAspectRatio: false,
       plugins: { legend: { display: false } },
       scales: {
-        y: { min: 0.08, max: 0.38,
-             grid: { color: 'rgba(255,255,255,0.04)' },
-             ticks: { color: '#6b7280', font: { family: 'Space Mono', size: 9 } } },
+        y: { min: 0.08, max: 0.38, grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#4a5068', font: { family: 'JetBrains Mono', size: 9 } } },
         x: { display: false }
       }
     }
   });
 }
 
-// ── Toast ──────────────────────────────────────────────────────────────────
+function updateChart(d) {
+  if (!window.earChart) return;
+  window.earChart.data.datasets[0].data = earBuf.slice();
+  window.earChart.data.datasets[1].data = Array(earBuf.length).fill(d.threshold);
+  window.earChart.data.labels = earBuf.map(() => '');
+  window.earChart.update('none');
+}
+
+function updateTrend() {
+  let trend = '—', trendColor = 'var(--sub)';
+  if (earBuf.length > 10) {
+    const r = earBuf.slice(-10);
+    const a1 = r.slice(0,5).reduce((a,b)=>a+b,0)/5;
+    const a2 = r.slice(5).reduce((a,b)=>a+b,0)/5;
+    if (a2 > a1 + 0.002) { trend = '↑ improving'; trendColor = 'var(--green)'; }
+    else if (a2 < a1 - 0.002) { trend = '↓ declining'; trendColor = 'var(--red)'; }
+    else { trend = '→ stable'; trendColor = 'var(--sub)'; }
+  }
+  const el = document.getElementById('ear-trend');
+  if (el) { el.textContent = trend; el.style.color = trendColor; }
+}
+
+// ══ UI HELPERS ═══════════════════════════════════════════════════
+function setBanner(type, msg) {
+  const el = document.getElementById('conn-banner');
+  el.className = 'conn-banner' + (type === 'hidden' ? ' hidden' : type === 'ok' ? ' ok' : '');
+  el.textContent = msg;
+}
+
+function setIdle() {
+  document.getElementById('ear-num').textContent = '—';
+  document.getElementById('ear-num').className = 'ear-num ok';
+  document.getElementById('state-pill-wrap').innerHTML = '<span class="state-pill idle"><span class="dot"></span>IDLE</span>';
+  document.getElementById('frame-fill').style.width = '0%';
+  document.getElementById('frame-ct').textContent = '0 / 45';
+  document.getElementById('thr-label').textContent = '— waiting —';
+  document.getElementById('fps-stat').textContent = '—';
+}
+
 let _toastEl;
-function toast(msg) {
-  if (_toastEl) { _toastEl.classList.add('out'); setTimeout(() => _toastEl && _toastEl.remove(), 300); }
+function toast(msg, type = '') {
+  if (_toastEl) { _toastEl.classList.add('out'); setTimeout(() => _toastEl?.remove(), 300); }
   _toastEl = document.createElement('div');
-  _toastEl.className = 'toast';
+  _toastEl.className = 'toast' + (type ? ' ' + type : '');
   _toastEl.textContent = msg;
   document.body.appendChild(_toastEl);
-  setTimeout(() => {
-    if (_toastEl) { _toastEl.classList.add('out'); setTimeout(() => _toastEl && _toastEl.remove(), 300); }
-  }, 2800);
+  setTimeout(() => { if (_toastEl) { _toastEl.classList.add('out'); setTimeout(() => _toastEl?.remove(), 300); } }, 3000);
 }
 
+// ══ BOOT ═════════════════════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', () => {
-  document.getElementById('detect-feed').style.display = 'none';
-  document.getElementById('calib-feed').style.display = 'none';
-  setTimeout(initChart, 100);
-});
-
-function showAnalytics(session) {
-
-  console.log("SESSION DATA:", session);
-  console.log("EAR length:", session.ear_series.length);
-
-  if (!session.ear_series || session.ear_series.length === 0) {
-    toast("No EAR data for this session");
-    return;
-  }
-
-  const container = document.getElementById('analyticsContainer');
-
-
-  const canvas = document.getElementById('analyticsChart');
-  const ctx = canvas.getContext('2d');
-
-  window.analyticsChart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: session.ear_series.map((_, i) => i),
-      datasets: [
-        {
-          label: 'EAR',
-          data: session.ear_series,
-          borderColor: '#3b82f6',
-          borderWidth: 2,
-          tension: 0.3,
-          pointRadius: 0
-        },
-        {
-          label: 'Threshold',
-          data: Array(session.ear_series.length).fill(session.threshold),
-          borderColor: 'orange',
-          borderDash: [5,5],
-          borderWidth: 2,
-          pointRadius: 0
-        },
-        {
-          label: 'Alarms',
-          data: session.ear_series.map((v, i) => 
-            v < session.threshold ? v : null
-          ),
-          pointBackgroundColor: 'red',
-          pointRadius: 4,
-          showLine: false
-        }
-      ]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: false,
-      plugins: {
-        legend: { display: true }
-      },
-      scales: {
-        y: {
-          min: 0.1,
-          max: 0.4
-        }
-      }
-    }
+  // Keyboard submit
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    if (!document.getElementById('form-login').classList.contains('hidden')) doLogin();
+    else if (!document.getElementById('form-signup').classList.contains('hidden')) doSignup();
   });
 
-  console.log("✅ FORCED chart render");
-}
-
-function openSession(s) {
-  showAnalytics(s);
-}
+  const saved = localStorage.getItem('dg_user');
+  if (token && saved) {
+    try {
+      currentUser = JSON.parse(saved);
+      showApp();
+    } catch { localStorage.clear(); }
+  }
+});
