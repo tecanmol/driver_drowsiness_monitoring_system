@@ -5,6 +5,7 @@ import os
 import hashlib
 import secrets
 from datetime import datetime
+from io import BytesIO
 
 from flask import Flask, send_from_directory, Response, request, jsonify
 from flask_socketio import SocketIO, emit, join_room, leave_room
@@ -14,6 +15,12 @@ import dlib
 from scipy.spatial import distance as scipy_distance
 import numpy as np
 from collections import deque
+
+# ── MongoDB ──────────────────────────────────────────────────────
+from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
+import gridfs
+
 try:
     import imageio
     IMAGEIO_AVAILABLE = True
@@ -29,7 +36,6 @@ try:
 except:
     AUDIO_ENABLED = False
 
-# Load alarm sound once at module level so it survives thread restarts
 _alarm_sound = None
 
 # ── Flask setup ─────────────────────────────────────────────────
@@ -41,8 +47,27 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 BASE_DIR = os.path.dirname(__file__)
 PREDICTOR_PATH = os.path.join(BASE_DIR, 'models', 'shape_predictor_68_face_landmarks.dat')
 ALARM_PATH = os.path.join(BASE_DIR, 'alarm.wav')
-USERS_FILE = os.path.join(BASE_DIR, 'users.json')
-SESSIONS_FILE = os.path.join(BASE_DIR, 'sessions.json')
+
+# ── MongoDB Atlas connection ─────────────────────────────────────
+from dotenv import load_dotenv
+load_dotenv()
+
+MONGO_URI = os.environ.get('MONGO_URI')
+if not MONGO_URI:
+    raise RuntimeError("MONGO_URI not set — add it to your .env file")
+
+_mongo_client = MongoClient(MONGO_URI)
+_db = _mongo_client['drowseguard']
+_users_col = _db['users']
+_sessions_col = _db['sessions']
+_fs = gridfs.GridFS(_db)  # For GIF clip storage
+
+# Ensure indexes
+_users_col.create_index('username', unique=True)
+_sessions_col.create_index('driver')
+_sessions_col.create_index('manager')
+
+print("✅ Connected to MongoDB Atlas")
 
 # ── Config ──────────────────────────────────────────────────────
 EAR_THRESHOLD = 0.17
@@ -50,7 +75,6 @@ EAR_CONSEC_FRAMES = 45
 CALIBRATION_FRAMES = 150
 ALARM_COOLDOWN = 1
 
-# Load alarm sound once at module level — survives across thread restarts
 if AUDIO_ENABLED and os.path.exists(ALARM_PATH):
     try:
         _alarm_sound = mixer.Sound(ALARM_PATH)
@@ -59,47 +83,128 @@ if AUDIO_ENABLED and os.path.exists(ALARM_PATH):
         _alarm_sound = None
 
 # ── Per-driver detection state ───────────────────────────────────
-driver_states = {}  # sid -> state dict
+driver_states = {}
 latest_frame = None
 frame_lock = threading.Lock()
-_detector_threads = {}  # sid -> thread
-_stop_events = {}       # sid -> Event
+_detector_threads = {}
+_stop_events = {}
 
 # ── Token store ─────────────────────────────────────────────────
 active_tokens = {}  # token -> username
 
 
+# ════════════════════════════════════════════════════════════════
+# DB helpers  (replace flat-file load/save_users / load/save_sessions)
+# ════════════════════════════════════════════════════════════════
+
 def hash_password(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
 
-def load_users():
-    if os.path.exists(USERS_FILE):
-        try:
-            with open(USERS_FILE) as f:
-                return json.load(f)
-        except:
-            pass
-    return {}
 
-def save_users(users):
-    with open(USERS_FILE, 'w') as f:
-        json.dump(users, f, indent=2)
+# ── Users ────────────────────────────────────────────────────────
 
-def load_sessions():
-    if os.path.exists(SESSIONS_FILE):
-        try:
-            with open(SESSIONS_FILE) as f:
-                return json.load(f)
-        except:
-            pass
-    return []
+def get_user(username):
+    """Return user dict or None."""
+    doc = _users_col.find_one({'username': username}, {'_id': 0})
+    return doc
 
-def save_sessions(sessions):
-    with open(SESSIONS_FILE, 'w') as f:
-        json.dump(sessions, f, indent=2)
+
+def create_user(username, data: dict):
+    """Insert a new user. Raises DuplicateKeyError if username taken."""
+    doc = {'username': username, **data}
+    _users_col.insert_one(doc)
+
+
+def update_user(username, fields: dict):
+    """Partial update on a user document."""
+    _users_col.update_one({'username': username}, {'$set': fields})
+
+
+def list_users_by_role(role, manager=None):
+    """Return list of user dicts matching role (and optionally manager)."""
+    q = {'role': role}
+    if manager is not None:
+        q['manager'] = manager
+    return list(_users_col.find(q, {'_id': 0}))
+
+
+# ── Sessions ─────────────────────────────────────────────────────
+
+def insert_session(session: dict):
+    _sessions_col.insert_one({**session})  # MongoDB adds _id
+
+
+def get_sessions_for_driver(username):
+    docs = list(_sessions_col.find({'driver': username}, {'_id': 0}).sort('date', -1).limit(200))
+    return docs
+
+
+def get_sessions_for_admin(manager_username):
+    # Find all drivers under this admin
+    drivers = {u['username'] for u in list_users_by_role('driver', manager=manager_username)}
+    docs = list(_sessions_col.find({'driver': {'$in': list(drivers)}}, {'_id': 0}).sort('date', -1).limit(200))
+    return docs
+
+
+def count_sessions_today(manager_username):
+    drivers = {u['username'] for u in list_users_by_role('driver', manager=manager_username)}
+    today = datetime.now().strftime('%Y-%m-%d')
+    return _sessions_col.count_documents({
+        'driver': {'$in': list(drivers)},
+        'date': {'$regex': f'^{today}'}
+    })
+
+
+# ── GridFS clips ─────────────────────────────────────────────────
+
+def save_gif_to_gridfs(frames, clip_id: str, username: str):
+    """
+    Build GIF in memory and store in GridFS.
+    clip_id  : unique string used as the GridFS filename (also the key
+               stored in the session's clips array).
+    Returns True on success, False on failure.
+    """
+    if not IMAGEIO_AVAILABLE or not frames:
+        return False
+    try:
+        sampled = frames[::2]
+        rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in sampled]
+        h, w = rgb[0].shape[:2]
+        scale = 320 / w
+        nh, nw = int(h * scale), 320
+        rgb_small = [cv2.resize(f, (nw, nh)) for f in rgb]
+
+        buf = BytesIO()
+        imageio.mimsave(buf, rgb_small, format='GIF', fps=10, loop=0)
+        buf.seek(0)
+
+        # Remove any previous file with same clip_id (re-saves)
+        for old in _fs.find({'filename': clip_id}):
+            _fs.delete(old._id)
+
+        _fs.put(buf.read(), filename=clip_id, username=username,
+                content_type='image/gif',
+                upload_date=datetime.utcnow())
+        return True
+    except Exception as e:
+        print(f"GridFS GIF save error: {e}")
+        return False
+
+
+def get_gif_from_gridfs(clip_id: str):
+    """Return (bytes, content_type) or (None, None)."""
+    try:
+        f = _fs.find_one({'filename': clip_id})
+        if f:
+            return f.read(), 'image/gif'
+    except Exception as e:
+        print(f"GridFS read error: {e}")
+    return None, None
+
 
 def get_user_from_token(token):
     return active_tokens.get(token)
+
 
 # ── EAR Calculation ─────────────────────────────────────────────
 def calc_ear(eye):
@@ -108,7 +213,11 @@ def calc_ear(eye):
     C = scipy_distance.euclidean(eye[0], eye[3])
     return (A + B) / (2.0 * C)
 
-# ── Auth REST endpoints ──────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════
+# Auth REST endpoints
+# ════════════════════════════════════════════════════════════════
+
 @app.route('/api/signup', methods=['POST'])
 def signup():
     data = request.json
@@ -124,16 +233,12 @@ def signup():
     if len(password) < 4:
         return jsonify({'error': 'Password must be at least 4 characters'}), 400
 
-    users = load_users()
-    if username in users:
-        return jsonify({'error': 'Username already taken'}), 409
-
     if role == 'driver' and manager:
-        mgr_user = users.get(manager)
-        if not mgr_user or mgr_user.get('role') != 'admin':
+        mgr = get_user(manager)
+        if not mgr or mgr.get('role') != 'admin':
             return jsonify({'error': 'Selected manager not found'}), 400
 
-    users[username] = {
+    user_doc = {
         'password': hash_password(password),
         'role': role,
         'name': data.get('name', username),
@@ -142,7 +247,11 @@ def signup():
         'calibrated': False,
         'manager': manager if role == 'driver' else None,
     }
-    save_users(users)
+
+    try:
+        create_user(username, user_doc)
+    except DuplicateKeyError:
+        return jsonify({'error': 'Username already taken'}), 409
 
     token = secrets.token_hex(32)
     active_tokens[token] = username
@@ -151,11 +260,12 @@ def signup():
         'token': token,
         'username': username,
         'role': role,
-        'name': users[username]['name'],
-        'threshold': users[username]['threshold'],
-        'calibrated': users[username]['calibrated'],
-        'manager': users[username]['manager'],
+        'name': user_doc['name'],
+        'threshold': user_doc['threshold'],
+        'calibrated': user_doc['calibrated'],
+        'manager': user_doc['manager'],
     })
+
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -163,9 +273,7 @@ def login():
     username = data.get('username', '').strip().lower()
     password = data.get('password', '')
 
-    users = load_users()
-    user = users.get(username)
-
+    user = get_user(username)
     if not user or user['password'] != hash_password(password):
         return jsonify({'error': 'Invalid username or password'}), 401
 
@@ -182,39 +290,37 @@ def login():
         'manager': user.get('manager', None),
     })
 
+
 @app.route('/api/admins', methods=['GET'])
 def get_admins():
-    users = load_users()
-    admins = [
-        {'username': uname, 'name': udata.get('name', uname)}
-        for uname, udata in users.items()
-        if udata.get('role') == 'admin'
-    ]
-    return jsonify(admins)
+    admins = list_users_by_role('admin')
+    return jsonify([
+        {'username': u['username'], 'name': u.get('name', u['username'])}
+        for u in admins
+    ])
+
 
 @app.route('/api/drivers', methods=['GET'])
 def get_drivers():
     token = request.headers.get('Authorization', '').replace('Bearer ', '')
-    user = get_user_from_token(token)
-    if not user:
+    username = get_user_from_token(token)
+    if not username:
         return jsonify({'error': 'Unauthorized'}), 401
 
-    users = load_users()
-    if users[user].get('role') != 'admin':
+    user = get_user(username)
+    if not user or user.get('role') != 'admin':
         return jsonify({'error': 'Forbidden'}), 403
 
-    drivers = []
-    for uname, udata in users.items():
-        if udata.get('role') == 'driver' and udata.get('manager') == user:
-            drivers.append({
-                'username': uname,
-                'name': udata.get('name', uname),
-                'calibrated': udata.get('calibrated', False),
-                'threshold': udata.get('threshold', EAR_THRESHOLD),
-                'created': udata.get('created', ''),
-                'manager': udata.get('manager', None),
-            })
-    return jsonify(drivers)
+    drivers = list_users_by_role('driver', manager=username)
+    return jsonify([{
+        'username': d['username'],
+        'name': d.get('name', d['username']),
+        'calibrated': d.get('calibrated', False),
+        'threshold': d.get('threshold', EAR_THRESHOLD),
+        'created': d.get('created', ''),
+        'manager': d.get('manager', None),
+    } for d in drivers])
+
 
 @app.route('/api/sessions', methods=['GET'])
 def get_sessions_api():
@@ -223,20 +329,29 @@ def get_sessions_api():
     if not username:
         return jsonify({'error': 'Unauthorized'}), 401
 
-    users = load_users()
-    role = users[username].get('role', 'driver')
-
-    all_sessions = load_sessions()
+    user = get_user(username)
+    role = user.get('role', 'driver') if user else 'driver'
 
     if role == 'admin':
-        my_drivers = {
-            uname for uname, udata in users.items()
-            if udata.get('role') == 'driver' and udata.get('manager') == username
-        }
-        return jsonify([s for s in all_sessions if s.get('driver') in my_drivers])
+        return jsonify(get_sessions_for_admin(username))
     else:
-        my_sessions = [s for s in all_sessions if s.get('driver') == username]
-        return jsonify(my_sessions)
+        return jsonify(get_sessions_for_driver(username))
+
+
+# ── GridFS clip serving ───────────────────────────────────────────
+@app.route('/clips/<path:clip_id>')
+def serve_clip(clip_id):
+    """
+    Serve a GIF clip from GridFS.
+    clip_id is the filename stored in GridFS (e.g. "username/20240101_120000.gif").
+    The client uses the same URL format as before so no frontend changes needed.
+    """
+    data, content_type = get_gif_from_gridfs(clip_id)
+    if data is None:
+        return jsonify({'error': 'Clip not found'}), 404
+    return Response(data, mimetype=content_type,
+                    headers={'Cache-Control': 'public, max-age=3600'})
+
 
 # ── Static routes ────────────────────────────────────────────────
 @app.route('/')
@@ -255,10 +370,6 @@ def serve_js():
 def serve_static(filename):
     return send_from_directory('static', filename)
 
-@app.route('/clips/<path:filename>')
-def serve_clip(filename):
-    clips_dir = os.path.join(BASE_DIR, 'clips')
-    return send_from_directory(clips_dir, filename)
 
 # ── Video Streaming ─────────────────────────────────────────────
 def generate_frames():
@@ -275,13 +386,12 @@ def generate_frames():
 def video_feed():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-# ── Detection Thread ─────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════
+# Detection Thread
+# ════════════════════════════════════════════════════════════════
+
 def run_detection(sid, username, threshold, already_calibrated):
-    """
-    already_calibrated=True  → skip calibration, go straight to detection
-    already_calibrated=False → run calibration first (always, even if user was
-                               previously calibrated — used for recalibration)
-    """
     global latest_frame
 
     try:
@@ -291,7 +401,6 @@ def run_detection(sid, username, threshold, already_calibrated):
         socketio.emit('error', {'msg': str(e)}, to=sid)
         return
 
-    # Use the module-level alarm sound (loaded once, reused across restarts)
     alarm_sound = _alarm_sound
 
     cap = cv2.VideoCapture(0)
@@ -314,23 +423,12 @@ def run_detection(sid, username, threshold, already_calibrated):
     last_alarm = 0
     frame_times = []
     frame_buffer = deque(maxlen=90)
-    session_clips = []
+    session_clips = []          # list of clip_id strings (GridFS filenames)
     clip_saved_for_event = False
 
-    def save_gif(frames, path):
-        if not IMAGEIO_AVAILABLE:
-            return
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            sampled = frames[::2]
-            rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in sampled]
-            h, w = rgb[0].shape[:2]
-            scale = 320 / w
-            nh, nw = int(h * scale), 320
-            rgb_small = [cv2.resize(f, (nw, nh)) for f in rgb]
-            imageio.mimsave(path, rgb_small, fps=10, loop=0)
-        except Exception as e:
-            print(f"GIF save error: {e}")
+    def save_gif_async(frames, clip_id):
+        """Background thread: build GIF and push to GridFS."""
+        save_gif_to_gridfs(frames, clip_id, username)
 
     while not stop_event.is_set():
         t0 = time.time()
@@ -346,7 +444,7 @@ def run_detection(sid, username, threshold, already_calibrated):
 
         if faces:
             lm = landmark_predictor(gray, faces[0])
-            left = [(lm.part(n).x, lm.part(n).y) for n in range(36, 42)]
+            left  = [(lm.part(n).x, lm.part(n).y) for n in range(36, 42)]
             right = [(lm.part(n).x, lm.part(n).y) for n in range(42, 48)]
             ear = (calc_ear(left) + calc_ear(right)) / 2.0
             color = (0, 255, 0) if ear >= state['threshold'] else (0, 0, 255)
@@ -354,6 +452,7 @@ def run_detection(sid, username, threshold, already_calibrated):
                 for i in range(len(eye)):
                     cv2.line(frame, eye[i], eye[(i+1) % len(eye)], color, 1)
 
+        # ── Calibration phase ────────────────────────────────────
         if state['calibrating']:
             if ear:
                 calib_ears.append(ear)
@@ -369,12 +468,10 @@ def run_detection(sid, username, threshold, already_calibrated):
                 state['calibrating'] = False
                 state['calibrated'] = True
 
-                users = load_users()
-                if username in users:
-                    users[username]['threshold'] = round(new_threshold, 3)
-                    users[username]['calibrated'] = True
-                    save_users(users)
-
+                update_user(username, {
+                    'threshold': round(new_threshold, 3),
+                    'calibrated': True,
+                })
                 socketio.emit('calibrated', {'threshold': round(new_threshold, 3)}, to=sid)
 
             with frame_lock:
@@ -382,6 +479,7 @@ def run_detection(sid, username, threshold, already_calibrated):
             time.sleep(0.03)
             continue
 
+        # ── Detection phase ──────────────────────────────────────
         if ear:
             now = time.time()
             if ear < state['threshold']:
@@ -407,18 +505,18 @@ def run_detection(sid, username, threshold, already_calibrated):
                     clip_saved_for_event = True
                     snap = list(frame_buffer)
                     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    clip_rel = f"{username}/{ts}.gif"
-                    clip_abs = os.path.join(BASE_DIR, 'clips', clip_rel)
+                    # clip_id doubles as the GridFS filename and the URL path segment
+                    clip_id = f"{username}/{ts}.gif"
                     threading.Thread(
-                        target=save_gif,
-                        args=(snap, clip_abs),
+                        target=save_gif_async,
+                        args=(snap, clip_id),
                         daemon=True,
                     ).start()
-                    session_clips.append(clip_rel)
-                    state['last_clip'] = clip_rel
+                    session_clips.append(clip_id)
+                    state['last_clip'] = clip_id
 
-                users = load_users()
-                driver_manager = users.get(username, {}).get('manager')
+                user_doc = get_user(username)
+                driver_manager = user_doc.get('manager') if user_doc else None
                 alert_room = f'admin_room_{driver_manager}' if driver_manager else 'admin_room'
 
                 socketio.emit('driver_alert', {
@@ -430,9 +528,11 @@ def run_detection(sid, username, threshold, already_calibrated):
 
             state['status'] = 'drowsy' if is_drowsy else 'alert'
 
-            cv2.putText(frame, f"EAR: {round(ear,3)}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-            cv2.putText(frame, state['status'].upper(), (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                        (0,255,0) if state['status'] == "alert" else (0,0,255), 2)
+            cv2.putText(frame, f"EAR: {round(ear,3)}", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+            cv2.putText(frame, state['status'].upper(), (20, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1,
+                        (0,255,0) if state['status'] == 'alert' else (0,0,255), 2)
 
             frame_times.append(time.time() - t0)
             if len(frame_times) > 30:
@@ -452,8 +552,8 @@ def run_detection(sid, username, threshold, already_calibrated):
                 'driver': username,
             }, to=sid)
 
-            users = load_users()
-            driver_manager = users.get(username, {}).get('manager')
+            user_doc = get_user(username)
+            driver_manager = user_doc.get('manager') if user_doc else None
             status_room = f'admin_room_{driver_manager}' if driver_manager else 'admin_room'
             socketio.emit('driver_status', {
                 'driver': username,
@@ -475,10 +575,15 @@ def run_detection(sid, username, threshold, already_calibrated):
         'clips': session_clips,
     }, to=sid)
 
-# ── Socket Events ────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════
+# Socket Events
+# ════════════════════════════════════════════════════════════════
+
 @socketio.on('connect')
 def on_connect():
     pass
+
 
 @socketio.on('auth')
 def on_auth(data):
@@ -488,34 +593,40 @@ def on_auth(data):
         emit('auth_error', {'msg': 'Invalid session. Please log in again.'})
         return
 
-    users = load_users()
-    user = users.get(username, {})
-    role = user.get('role', 'driver')
+    user = get_user(username)
+    role = user.get('role', 'driver') if user else 'driver'
 
     if role == 'admin':
         join_room(f'admin_room_{username}')
         join_room('admin_room')
-        emit('auth_ok', {'username': username, 'role': role, 'name': user.get('name', username)})
+        emit('auth_ok', {
+            'username': username, 'role': role,
+            'name': user.get('name', username) if user else username,
+        })
         return
 
     sid = request.sid
     driver_states[sid] = {
-        'running': False, 'calibrating': False, 'calibrated': user.get('calibrated', False),
-        'calib_progress': 0, 'ear': 0.0, 'threshold': user.get('threshold', EAR_THRESHOLD),
-        'status': 'idle', 'drowsy_frames': 0, 'alarms': 0, 'fps': 0.0, 'start_time': None,
+        'running': False, 'calibrating': False,
+        'calibrated': user.get('calibrated', False) if user else False,
+        'calib_progress': 0, 'ear': 0.0,
+        'threshold': user.get('threshold', EAR_THRESHOLD) if user else EAR_THRESHOLD,
+        'status': 'idle', 'drowsy_frames': 0, 'alarms': 0,
+        'fps': 0.0, 'start_time': None,
     }
     emit('auth_ok', {
-        'username': username, 'role': role, 'name': user.get('name', username),
-        'threshold': user.get('threshold', EAR_THRESHOLD),
-        'calibrated': user.get('calibrated', False),
-        'manager': user.get('manager', None),
+        'username': username, 'role': role,
+        'name': user.get('name', username) if user else username,
+        'threshold': user.get('threshold', EAR_THRESHOLD) if user else EAR_THRESHOLD,
+        'calibrated': user.get('calibrated', False) if user else False,
+        'manager': user.get('manager', None) if user else None,
     })
+
 
 @socketio.on('start')
 def on_start(data=None):
     sid = request.sid
     token = (data or {}).get('token')
-    # ── FIX: read force_calibrate flag sent by the client ──────────
     force_calibrate = (data or {}).get('force_calibrate', False)
 
     username = get_user_from_token(token)
@@ -526,16 +637,14 @@ def on_start(data=None):
     if state['running']:
         return
 
-    users = load_users()
-    user = users.get(username, {})
+    user = get_user(username)
 
     _stop_events[sid] = threading.Event()
     state['running'] = True
     state['alarms'] = 0
     _stop_events[sid].clear()
 
-    # ── FIX: if force_calibrate is True, treat as uncalibrated ─────
-    already_calibrated = user.get('calibrated', False) and not force_calibrate
+    already_calibrated = (user.get('calibrated', False) if user else False) and not force_calibrate
 
     t = threading.Thread(
         target=run_detection,
@@ -546,11 +655,13 @@ def on_start(data=None):
     t.start()
     emit('started', {})
 
+
 @socketio.on('stop')
 def on_stop():
     sid = request.sid
     if sid in _stop_events:
         _stop_events[sid].set()
+
 
 @socketio.on('save_session')
 def on_save_session(data):
@@ -559,10 +670,9 @@ def on_save_session(data):
     if not username:
         return
 
-    users = load_users()
-    manager = users.get(username, {}).get('manager', None)
+    user = get_user(username)
+    manager = user.get('manager', None) if user else None
 
-    sessions = load_sessions()
     session = {
         'id': secrets.token_hex(8),
         'driver': username,
@@ -574,11 +684,12 @@ def on_save_session(data):
         'threshold': data.get('threshold', EAR_THRESHOLD),
         'alert_pct': data.get('alert_pct', 100),
         'ear_series': data.get('ear_series', []),
+        # clips is a list of GridFS filenames (same strings used in /clips/<clip_id>)
         'clips': data.get('clips', []),
     }
-    sessions.insert(0, session)
-    save_sessions(sessions[:200])
+    insert_session(session)
     emit('session_saved', session)
+
 
 @socketio.on('get_sessions')
 def on_get_sessions(data=None):
@@ -587,18 +698,14 @@ def on_get_sessions(data=None):
     if not username:
         return
 
-    users = load_users()
-    role = users.get(username, {}).get('role', 'driver')
-    all_sessions = load_sessions()
+    user = get_user(username)
+    role = user.get('role', 'driver') if user else 'driver'
 
     if role == 'admin':
-        my_drivers = {
-            uname for uname, udata in users.items()
-            if udata.get('role') == 'driver' and udata.get('manager') == username
-        }
-        emit('sessions', [s for s in all_sessions if s.get('driver') in my_drivers])
+        emit('sessions', get_sessions_for_admin(username))
     else:
-        emit('sessions', [s for s in all_sessions if s.get('driver') == username])
+        emit('sessions', get_sessions_for_driver(username))
+
 
 @socketio.on('admin_join')
 def on_admin_join(data):
@@ -606,8 +713,8 @@ def on_admin_join(data):
     username = get_user_from_token(token)
     if not username:
         return
-    users = load_users()
-    if users.get(username, {}).get('role') == 'admin':
+    user = get_user(username)
+    if user and user.get('role') == 'admin':
         join_room(f'admin_room_{username}')
         join_room('admin_room')
         active = []
@@ -616,12 +723,14 @@ def on_admin_join(data):
                 active.append({'driver': sid, 'status': st['status'], 'ear': st['ear']})
         emit('active_drivers', active)
 
+
 @socketio.on('disconnect')
 def on_disconnect():
     sid = request.sid
     if sid in _stop_events:
         _stop_events[sid].set()
     driver_states.pop(sid, None)
+
 
 if __name__ == '__main__':
     print("\n🚀 DrowseGuard Multi-Driver Server at http://localhost:5000\n")

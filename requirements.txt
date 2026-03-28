@@ -1,0 +1,23 @@
+# DrowseGuard — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# Web server
+flask
+flask-socketio
+eventlet               # async mode for flask-socketio
+
+# MongoDB
+pymongo[srv]           # [srv] adds dnspython for mongodb+srv:// URIs
+python-dotenv
+
+# Computer vision & face detection
+opencv-python
+dlib
+scipy
+numpy
+
+# GIF export
+imageio
+
+# Audio alerts
+pygame
