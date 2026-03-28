@@ -299,6 +299,14 @@ def video_feed():
 def index():
     return send_from_directory('.', 'index.html')
 
+@app.route('/style.css')
+def serve_css():
+    return send_from_directory('static', 'style.css')
+
+@app.route('/script.js')
+def serve_js():
+    return send_from_directory('static', 'script.js')
+
 @app.route('/clips/<path:filename>')
 def serve_clip(filename):
     return send_from_directory('clips', filename)
