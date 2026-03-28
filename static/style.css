@@ -755,6 +755,179 @@ nav { display: flex; gap: 4px; }
 
 .modal-chart-wrap { height: 180px; }
 
+/* --- ADDITIONS TO OLD CSS --- */
+
+/* New Navigation ID */
+#main-nav {
+  display: flex;
+  gap: 2px;
+  flex: 1;
+  margin-left: 8px;
+}
+
+/* State pill wrapper */
+#state-pill-wrap {
+  margin: 4px 0;
+}
+
+/* --- MANAGER SELECTOR (Signup Feature) --- */
+
+.manager-select-wrap {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--r2);
+  overflow: hidden;
+}
+
+.manager-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.manager-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--border2);
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.manager-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.manager-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 14px;
+  cursor: pointer;
+  transition: background 0.15s;
+  border-bottom: 1px solid var(--border);
+  position: relative;
+}
+
+.manager-option:last-child {
+  border-bottom: none;
+}
+
+.manager-option:hover {
+  background: var(--bg4);
+}
+
+.manager-option-avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--purple), var(--blue));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+}
+
+.manager-option-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.manager-option-username {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+
+.manager-option-check {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--blue);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.manager-option:hover .manager-option-check {
+  opacity: 0.5;
+}
+
+.manager-empty {
+  padding: 16px;
+  font-size: 13px;
+  color: var(--sub);
+  text-align: center;
+  line-height: 1.6;
+}
+
+.manager-selected-display {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 14px;
+  background: rgba(41,121,255,0.06);
+  border: 1px solid rgba(41,121,255,0.2);
+  border-radius: var(--r2);
+}
+
+.manager-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--purple), var(--blue));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  color: #fff;
+}
+
+.mgr-change-btn {
+  margin-left: auto;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border2);
+  background: var(--bg4);
+  color: var(--sub);
+  font-family: var(--sans);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.mgr-change-btn:hover {
+  color: var(--text);
+}
+
+.manager-chip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--r2);
+  padding: 10px 14px;
+  margin-top: 12px;
+}
+
+.manager-chip-icon {
+  font-size: 16px;
+}
+
+
+
 /* ── Scrollbar ────────────────────────────────────────────────── */
 ::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-thumb { background: var(--bg4); border-radius: 2px; }

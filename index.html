@@ -73,6 +73,32 @@
             </div>
           </div>
         </div>
+
+        <!-- Manager selector — shown only when role = driver -->
+        <div class="form-group" id="manager-group">
+          <label class="form-label">Fleet Manager</label>
+          <div class="manager-select-wrap" id="manager-select-wrap">
+            <!-- Populated by JS when signup tab opens or role switches to driver -->
+            <div class="manager-loading" id="manager-loading">
+              <div class="manager-spinner"></div>
+              <span>Loading managers…</span>
+            </div>
+            <div id="manager-list" class="manager-list hidden"></div>
+            <div id="manager-empty" class="manager-empty hidden">
+              No fleet managers registered yet.<br>
+              <span style="color:var(--muted);font-size:11px">A manager account must be created first.</span>
+            </div>
+          </div>
+          <div id="manager-selected-display" class="manager-selected-display hidden">
+            <div class="manager-avatar" id="mgr-avatar">?</div>
+            <div>
+              <div id="mgr-name" style="font-size:13px;font-weight:600"></div>
+              <div id="mgr-username" style="font-size:11px;color:var(--muted);font-family:var(--mono)"></div>
+            </div>
+            <button class="mgr-change-btn" onclick="clearManagerSelection()">Change</button>
+          </div>
+        </div>
+
         <div id="signup-error" class="auth-error hidden"></div>
         <button class="auth-btn" onclick="doSignup()">Create Account →</button>
       </div>
@@ -174,6 +200,15 @@
                 <div class="stat-val" id="fps-stat" style="color:var(--muted)">—</div>
               </div>
             </div>
+
+            <!-- Manager info chip (shown when driver has a manager) -->
+            <div id="manager-chip" class="manager-chip hidden">
+              <div class="manager-chip-icon">📊</div>
+              <div>
+                <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.4px">Reporting to</div>
+                <div id="manager-chip-name" style="font-size:13px;font-weight:600"></div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -210,7 +245,6 @@
               </div>
             </div>
           </div>
-          <!-- Current threshold status -->
           <div id="current-calib-status" style="display:flex;align-items:center;justify-content:space-between;background:var(--bg3);border-radius:var(--r2);padding:12px 16px;margin-bottom:16px">
             <div>
               <div style="font-size:11px;color:var(--sub);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:3px">Current Threshold</div>
@@ -223,7 +257,6 @@
             <button id="recalib-btn" class="btn hidden" style="flex:0;padding:7px 14px;font-size:12px;color:var(--amber);border-color:rgba(255,171,0,0.3);background:rgba(255,171,0,0.07)" onclick="confirmRecalib()">↺ Recalibrate</button>
           </div>
 
-          <!-- Recalibrate confirm warning (shown before wiping old threshold) -->
           <div id="recalib-confirm" class="hidden" style="background:rgba(255,23,68,0.08);border:1px solid rgba(255,23,68,0.2);border-radius:var(--r2);padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;gap:12px">
             <span style="font-size:13px;color:var(--red)">⚠ This will replace your saved threshold. Are you sure?</span>
             <div style="display:flex;gap:8px;flex-shrink:0">

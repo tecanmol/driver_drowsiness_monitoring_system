@@ -6,8 +6,9 @@ let running = false;
 let earBuf = [];
 let currentThreshold = 0.17;
 let selectedRole = 'driver';
+let selectedManager = null;   // { username, name } or null
 let sessionChartInst = null;
-let driverCards = {};  // username -> card data
+let driverCards = {};
 let alertCount = 0;
 let allSessions = [];
 let allDrivers = [];
@@ -18,12 +19,85 @@ function switchAuthTab(tab) {
   document.getElementById('form-signup').classList.toggle('hidden', tab !== 'signup');
   document.getElementById('tab-login').classList.toggle('active', tab === 'login');
   document.getElementById('tab-signup').classList.toggle('active', tab !== 'login');
+  if (tab === 'signup') loadManagersForSignup();
 }
 
 function selectRole(r) {
   selectedRole = r;
   document.getElementById('role-driver').classList.toggle('active', r === 'driver');
   document.getElementById('role-admin').classList.toggle('active', r === 'admin');
+  // Show/hide manager selector depending on role
+  document.getElementById('manager-group').classList.toggle('hidden', r !== 'driver');
+  if (r === 'driver') loadManagersForSignup();
+}
+
+// ── Manager selection for signup ─────────────────────────────────
+async function loadManagersForSignup() {
+  const wrap = document.getElementById('manager-select-wrap');
+  const list = document.getElementById('manager-list');
+  const empty = document.getElementById('manager-empty');
+  const loading = document.getElementById('manager-loading');
+  const display = document.getElementById('manager-selected-display');
+
+  // Already picked — don't re-render the list
+  if (selectedManager) return;
+
+  loading.classList.remove('hidden');
+  list.classList.add('hidden');
+  empty.classList.add('hidden');
+  display.classList.add('hidden');
+
+  try {
+    const res = await fetch('/api/admins');
+    const admins = await res.json();
+
+    loading.classList.add('hidden');
+
+    if (!admins.length) {
+      empty.classList.remove('hidden');
+      return;
+    }
+
+    list.innerHTML = admins.map(a => `
+      <div class="manager-option" onclick="selectManager('${a.username}', '${escapeAttr(a.name)}')">
+        <div class="manager-option-avatar">${a.name[0].toUpperCase()}</div>
+        <div>
+          <div class="manager-option-name">${a.name}</div>
+          <div class="manager-option-username">@${a.username}</div>
+        </div>
+        <div class="manager-option-check">✓</div>
+      </div>
+    `).join('');
+    list.classList.remove('hidden');
+  } catch (e) {
+    loading.classList.add('hidden');
+    empty.classList.remove('hidden');
+  }
+}
+
+function selectManager(username, name) {
+  selectedManager = { username, name };
+
+  // Hide the list, show the selected display
+  document.getElementById('manager-list').classList.add('hidden');
+  document.getElementById('manager-empty').classList.add('hidden');
+  document.getElementById('manager-loading').classList.add('hidden');
+
+  document.getElementById('mgr-avatar').textContent = name[0].toUpperCase();
+  document.getElementById('mgr-name').textContent = name;
+  document.getElementById('mgr-username').textContent = '@' + username;
+  document.getElementById('manager-selected-display').classList.remove('hidden');
+}
+
+function clearManagerSelection() {
+  selectedManager = null;
+  document.getElementById('manager-selected-display').classList.add('hidden');
+  // Re-show the list
+  document.getElementById('manager-list').classList.remove('hidden');
+}
+
+function escapeAttr(s) {
+  return s.replace(/'/g, "\\'").replace(/"/g, '&quot;');
 }
 
 async function doLogin() {
@@ -52,14 +126,30 @@ async function doSignup() {
   const password = document.getElementById('signup-pass').value;
   const errEl = document.getElementById('signup-error');
 
+  // Drivers must pick a manager if any exist
+  if (selectedRole === 'driver' && !selectedManager) {
+    const empty = document.getElementById('manager-empty');
+    // Only block if managers actually exist (empty notice is hidden means list loaded)
+    if (empty.classList.contains('hidden')) {
+      errEl.textContent = 'Please select a fleet manager.';
+      errEl.classList.remove('hidden');
+      return;
+    }
+  }
+
+  errEl.classList.add('hidden');
+
   try {
     const res = await fetch('/api/signup', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ name, username, password, role: selectedRole })
+      body: JSON.stringify({
+        name, username, password,
+        role: selectedRole,
+        manager: selectedRole === 'driver' && selectedManager ? selectedManager.username : null,
+      })
     });
     const data = await res.json();
     if (!res.ok) { errEl.textContent = data.error; errEl.classList.remove('hidden'); return; }
-    errEl.classList.add('hidden');
     initSession(data);
   } catch(e) {
     errEl.textContent = 'Cannot connect to server. Is server.py running?';
@@ -109,9 +199,29 @@ function showApp() {
       document.getElementById('calib-notice').classList.remove('hidden');
     }
     updateCalibStatus(u.calibrated, u.threshold);
+
+    // Show manager chip if driver has one
+    if (u.manager) {
+      showManagerChip(u.manager);
+    }
+
     initDriverSocket();
     setTimeout(initChart, 100);
   }
+}
+
+function showManagerChip(managerUsername) {
+  // Fetch the manager's display name
+  fetch('/api/admins')
+    .then(r => r.json())
+    .then(admins => {
+      const mgr = admins.find(a => a.username === managerUsername);
+      if (!mgr) return;
+      const chip = document.getElementById('manager-chip');
+      document.getElementById('manager-chip-name').textContent = mgr.name;
+      chip.classList.remove('hidden');
+    })
+    .catch(() => {});
 }
 
 function buildNav(role) {
@@ -139,7 +249,6 @@ function showPage(id) {
     if (b.textContent.toLowerCase().includes(id.slice(0,4).toLowerCase())) b.classList.add('active');
   });
   if (id === 'detect') setTimeout(initChart, 50);
-  // Hide feeds when not on their page
   if (id !== 'detect') document.getElementById('detect-feed').style.display = 'none';
   if (id !== 'calibrate') document.getElementById('calib-feed').style.display = 'none';
 }
@@ -253,7 +362,6 @@ function initDriverSocket() {
     document.getElementById('calib-cam-placeholder').style.display = 'flex';
     document.getElementById('calib-notice').classList.add('hidden');
     updateCalibStatus(true, d.threshold);
-    // update stored user
     const saved = JSON.parse(localStorage.getItem('dg_user') || '{}');
     saved.calibrated = true;
     saved.threshold = d.threshold;
@@ -272,7 +380,6 @@ function toggleDetect() {
 }
 
 function startCalib() {
-  // hide confirm dialog if visible
   document.getElementById('recalib-confirm').classList.add('hidden');
   socket.emit('stop');
   document.getElementById('calib-pct').textContent = '0%';
@@ -299,9 +406,7 @@ function updateCalibStatus(calibrated, threshold) {
   document.getElementById('current-thr-val').textContent = thr.toFixed(3);
   document.getElementById('current-calib-badge').classList.toggle('hidden', !calibrated);
   document.getElementById('default-calib-badge').classList.toggle('hidden', calibrated);
-  // show recalibrate button only if already calibrated
   document.getElementById('recalib-btn').classList.toggle('hidden', !calibrated);
-  // if calibrated, hide the main "Begin Calibration" button (use recalibrate flow instead)
   const calibBtn = document.getElementById('calib-btn');
   calibBtn.style.display = calibrated ? 'none' : 'block';
 }
@@ -342,7 +447,6 @@ function initAdminSocket() {
   });
 
   socket.on('active_drivers', (list) => {
-    // mark active
     list.forEach(d => updateDriverCard(d.driver, d));
   });
 
@@ -359,7 +463,6 @@ async function loadAdminFleet() {
     renderFleetGrid(allDrivers);
   } catch(e) {}
 
-  // sessions count
   try {
     const res2 = await fetch('/api/sessions', { headers: {'Authorization': 'Bearer ' + token} });
     if (res2.ok) {
@@ -378,7 +481,7 @@ function loadAdminSessions() {
 function renderFleetGrid(drivers) {
   const grid = document.getElementById('fleet-grid');
   if (!drivers.length) {
-    grid.innerHTML = '<div class="empty">No drivers registered yet.</div>';
+    grid.innerHTML = '<div class="empty">No drivers assigned to you yet.</div>';
     return;
   }
   grid.innerHTML = '';
@@ -452,7 +555,6 @@ function updateDriverCard(username, data) {
   card.classList.toggle('active', !isDrowsy);
   card.classList.toggle('drowsy', isDrowsy);
 
-  // Update active count
   const activeCards = document.querySelectorAll('.driver-card.active, .driver-card.drowsy');
   document.getElementById('stat-active').textContent = activeCards.length;
 }
@@ -474,7 +576,6 @@ function addAlertFeedItem(d) {
     <div class="alert-time">${d.timestamp}</div>`;
   feed.insertBefore(item, feed.firstChild);
 
-  // Keep max 20
   const items = feed.querySelectorAll('.alert-item');
   if (items.length > 20) items[items.length - 1].remove();
 }
@@ -548,7 +649,6 @@ function openSession(s) {
   document.getElementById('modal-alarms').textContent = s.alarms ?? '—';
   document.getElementById('modal-pct').textContent = (s.alert_pct ?? 100) + '%';
 
-  // Render clips
   const clipsWrap = document.getElementById('modal-clips');
   const clips = s.clips || (s.clip ? [s.clip] : []);
   if (clips.length) {
@@ -574,7 +674,6 @@ function openSession(s) {
     clipsWrap.style.display = 'none';
   }
 
-  // Destroy old chart
   if (sessionChartInst) { sessionChartInst.destroy(); sessionChartInst = null; }
 
   const ctx = document.getElementById('session-chart');
@@ -699,7 +798,6 @@ function toast(msg, type = '') {
 
 // ══ BOOT ═════════════════════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', () => {
-  // Keyboard submit
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter') return;
     if (!document.getElementById('form-login').classList.contains('hidden')) doLogin();

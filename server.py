@@ -104,6 +104,7 @@ def signup():
     username = data.get('username', '').strip().lower()
     password = data.get('password', '')
     role = data.get('role', 'driver')  # 'driver' or 'admin'
+    manager = data.get('manager', None)  # username of assigned manager
 
     if not username or not password:
         return jsonify({'error': 'Username and password required'}), 400
@@ -116,6 +117,12 @@ def signup():
     if username in users:
         return jsonify({'error': 'Username already taken'}), 409
 
+    # Validate manager exists and is actually an admin (drivers only)
+    if role == 'driver' and manager:
+        mgr_user = users.get(manager)
+        if not mgr_user or mgr_user.get('role') != 'admin':
+            return jsonify({'error': 'Selected manager not found'}), 400
+
     users[username] = {
         'password': hash_password(password),
         'role': role,
@@ -123,6 +130,7 @@ def signup():
         'created': datetime.now().isoformat(),
         'threshold': EAR_THRESHOLD,
         'calibrated': False,
+        'manager': manager if role == 'driver' else None,
     }
     save_users(users)
 
@@ -136,6 +144,7 @@ def signup():
         'name': users[username]['name'],
         'threshold': users[username]['threshold'],
         'calibrated': users[username]['calibrated'],
+        'manager': users[username]['manager'],
     })
 
 @app.route('/api/login', methods=['POST'])
@@ -160,7 +169,19 @@ def login():
         'name': user.get('name', username),
         'threshold': user.get('threshold', EAR_THRESHOLD),
         'calibrated': user.get('calibrated', False),
+        'manager': user.get('manager', None),
     })
+
+# ── NEW: List all admins (managers) — public, used during signup ─
+@app.route('/api/admins', methods=['GET'])
+def get_admins():
+    users = load_users()
+    admins = [
+        {'username': uname, 'name': udata.get('name', uname)}
+        for uname, udata in users.items()
+        if udata.get('role') == 'admin'
+    ]
+    return jsonify(admins)
 
 @app.route('/api/drivers', methods=['GET'])
 def get_drivers():
@@ -173,15 +194,17 @@ def get_drivers():
     if users[user].get('role') != 'admin':
         return jsonify({'error': 'Forbidden'}), 403
 
+    # Admins only see drivers assigned to them
     drivers = []
     for uname, udata in users.items():
-        if udata.get('role') == 'driver':
+        if udata.get('role') == 'driver' and udata.get('manager') == user:
             drivers.append({
                 'username': uname,
                 'name': udata.get('name', uname),
                 'calibrated': udata.get('calibrated', False),
                 'threshold': udata.get('threshold', EAR_THRESHOLD),
                 'created': udata.get('created', ''),
+                'manager': udata.get('manager', None),
             })
     return jsonify(drivers)
 
@@ -198,7 +221,12 @@ def get_sessions_api():
     all_sessions = load_sessions()
 
     if role == 'admin':
-        return jsonify(all_sessions)
+        # Only sessions from this admin's drivers
+        my_drivers = {
+            uname for uname, udata in users.items()
+            if udata.get('role') == 'driver' and udata.get('manager') == username
+        }
+        return jsonify([s for s in all_sessions if s.get('driver') in my_drivers])
     else:
         my_sessions = [s for s in all_sessions if s.get('driver') == username]
         return jsonify(my_sessions)
@@ -222,7 +250,6 @@ def serve_static(filename):
 
 @app.route('/clips/<path:filename>')
 def serve_clip(filename):
-    # supports clips/<username>/xxx.gif
     clips_dir = os.path.join(BASE_DIR, 'clips')
     return send_from_directory(clips_dir, filename)
 
@@ -275,21 +302,17 @@ def run_detection(sid, username, threshold, already_calibrated):
     drowsy_frames = 0
     last_alarm = 0
     frame_times = []
-    # Rolling frame buffer: ~3 seconds at 30fps before the alarm moment
     frame_buffer = deque(maxlen=90)
-    session_clips = []          # list of clip paths saved this session
-    clip_saved_for_event = False  # one GIF per continuous drowsy event
+    session_clips = []
+    clip_saved_for_event = False
 
     def save_gif(frames, path):
-        """Save a lightweight GIF in a background thread."""
         if not IMAGEIO_AVAILABLE:
             return
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            # Every other frame → ~15fps feel, much smaller file
             sampled = frames[::2]
             rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in sampled]
-            # Resize to 320-wide to keep file tiny
             h, w = rgb[0].shape[:2]
             scale = 320 / w
             nh, nw = int(h * scale), 320
@@ -304,7 +327,6 @@ def run_detection(sid, username, threshold, already_calibrated):
         if not ret:
             continue
 
-        # Always buffer raw frames (before any overlay) for GIF saving
         frame_buffer.append(frame.copy())
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -321,7 +343,6 @@ def run_detection(sid, username, threshold, already_calibrated):
                 for i in range(len(eye)):
                     cv2.line(frame, eye[i], eye[(i+1) % len(eye)], color, 1)
 
-        # Calibration
         if state['calibrating']:
             if ear:
                 calib_ears.append(ear)
@@ -337,7 +358,6 @@ def run_detection(sid, username, threshold, already_calibrated):
                 state['calibrating'] = False
                 state['calibrated'] = True
 
-                # Persist threshold
                 users = load_users()
                 if username in users:
                     users[username]['threshold'] = round(new_threshold, 3)
@@ -351,7 +371,6 @@ def run_detection(sid, username, threshold, already_calibrated):
             time.sleep(0.03)
             continue
 
-        # Detection
         if ear:
             now = time.time()
             if ear < state['threshold']:
@@ -361,7 +380,6 @@ def run_detection(sid, username, threshold, already_calibrated):
 
             is_drowsy = drowsy_frames >= EAR_CONSEC_FRAMES
 
-            # Reset the per-event lock when eyes reopen
             if not is_drowsy:
                 clip_saved_for_event = False
 
@@ -374,10 +392,9 @@ def run_detection(sid, username, threshold, already_calibrated):
                         pass
                 last_alarm = now
 
-                # Save one GIF per continuous drowsy event (not every alarm beep)
                 if not clip_saved_for_event:
                     clip_saved_for_event = True
-                    snap = list(frame_buffer)   # frames leading up to this moment
+                    snap = list(frame_buffer)
                     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
                     clip_rel = f"{username}/{ts}.gif"
                     clip_abs = os.path.join(BASE_DIR, 'clips', clip_rel)
@@ -389,13 +406,17 @@ def run_detection(sid, username, threshold, already_calibrated):
                     session_clips.append(clip_rel)
                     state['last_clip'] = clip_rel
 
-                # Broadcast drowsy alert to admin room (include clip path once ready)
+                # Look up driver's manager to target alert to correct admin room
+                users = load_users()
+                driver_manager = users.get(username, {}).get('manager')
+                alert_room = f'admin_room_{driver_manager}' if driver_manager else 'admin_room'
+
                 socketio.emit('driver_alert', {
                     'driver': username,
                     'ear': round(ear, 3),
                     'timestamp': datetime.now().strftime('%H:%M:%S'),
                     'clip': state.get('last_clip'),
-                }, to='admin_room')
+                }, to=alert_room)
 
             state['status'] = 'drowsy' if is_drowsy else 'alert'
 
@@ -421,13 +442,16 @@ def run_detection(sid, username, threshold, already_calibrated):
                 'driver': username,
             }, to=sid)
 
-            # Live status to admin
+            # Live status to this driver's manager room only
+            users = load_users()
+            driver_manager = users.get(username, {}).get('manager')
+            status_room = f'admin_room_{driver_manager}' if driver_manager else 'admin_room'
             socketio.emit('driver_status', {
                 'driver': username,
                 'ear': round(ear, 3),
                 'status': state['status'],
                 'alarms': state['alarms'],
-            }, to='admin_room')
+            }, to=status_room)
 
         with frame_lock:
             latest_frame = frame.copy()
@@ -460,11 +484,12 @@ def on_auth(data):
     role = user.get('role', 'driver')
 
     if role == 'admin':
-        join_room('admin_room')
+        # Each admin joins their own private room
+        join_room(f'admin_room_{username}')
+        join_room('admin_room')  # keep global room for compatibility
         emit('auth_ok', {'username': username, 'role': role, 'name': user.get('name', username)})
         return
 
-    # Driver
     sid = request.sid
     driver_states[sid] = {
         'running': False, 'calibrating': False, 'calibrated': user.get('calibrated', False),
@@ -475,6 +500,7 @@ def on_auth(data):
         'username': username, 'role': role, 'name': user.get('name', username),
         'threshold': user.get('threshold', EAR_THRESHOLD),
         'calibrated': user.get('calibrated', False),
+        'manager': user.get('manager', None),
     })
 
 @socketio.on('start')
@@ -519,10 +545,14 @@ def on_save_session(data):
     if not username:
         return
 
+    users = load_users()
+    manager = users.get(username, {}).get('manager', None)
+
     sessions = load_sessions()
     session = {
         'id': secrets.token_hex(8),
         'driver': username,
+        'manager': manager,
         'date': datetime.now().strftime('%Y-%m-%d %H:%M'),
         'duration': data.get('runtime', 0),
         'alarms': data.get('alarms', 0),
@@ -548,7 +578,11 @@ def on_get_sessions(data=None):
     all_sessions = load_sessions()
 
     if role == 'admin':
-        emit('sessions', all_sessions)
+        my_drivers = {
+            uname for uname, udata in users.items()
+            if udata.get('role') == 'driver' and udata.get('manager') == username
+        }
+        emit('sessions', [s for s in all_sessions if s.get('driver') in my_drivers])
     else:
         emit('sessions', [s for s in all_sessions if s.get('driver') == username])
 
@@ -560,8 +594,8 @@ def on_admin_join(data):
         return
     users = load_users()
     if users.get(username, {}).get('role') == 'admin':
+        join_room(f'admin_room_{username}')
         join_room('admin_room')
-        # Send current active drivers
         active = []
         for sid, st in driver_states.items():
             if st['running']:
