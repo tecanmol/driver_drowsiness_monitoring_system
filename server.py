@@ -29,6 +29,9 @@ try:
 except:
     AUDIO_ENABLED = False
 
+# Load alarm sound once at module level so it survives thread restarts
+_alarm_sound = None
+
 # ── Flask setup ─────────────────────────────────────────────────
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'drowseguard-secret-2024'
@@ -46,6 +49,14 @@ EAR_THRESHOLD = 0.17
 EAR_CONSEC_FRAMES = 45
 CALIBRATION_FRAMES = 150
 ALARM_COOLDOWN = 1
+
+# Load alarm sound once at module level — survives across thread restarts
+if AUDIO_ENABLED and os.path.exists(ALARM_PATH):
+    try:
+        _alarm_sound = mixer.Sound(ALARM_PATH)
+    except Exception as e:
+        print(f"⚠ Could not load alarm sound: {e}")
+        _alarm_sound = None
 
 # ── Per-driver detection state ───────────────────────────────────
 driver_states = {}  # sid -> state dict
@@ -103,8 +114,8 @@ def signup():
     data = request.json
     username = data.get('username', '').strip().lower()
     password = data.get('password', '')
-    role = data.get('role', 'driver')  # 'driver' or 'admin'
-    manager = data.get('manager', None)  # username of assigned manager
+    role = data.get('role', 'driver')
+    manager = data.get('manager', None)
 
     if not username or not password:
         return jsonify({'error': 'Username and password required'}), 400
@@ -117,7 +128,6 @@ def signup():
     if username in users:
         return jsonify({'error': 'Username already taken'}), 409
 
-    # Validate manager exists and is actually an admin (drivers only)
     if role == 'driver' and manager:
         mgr_user = users.get(manager)
         if not mgr_user or mgr_user.get('role') != 'admin':
@@ -172,7 +182,6 @@ def login():
         'manager': user.get('manager', None),
     })
 
-# ── NEW: List all admins (managers) — public, used during signup ─
 @app.route('/api/admins', methods=['GET'])
 def get_admins():
     users = load_users()
@@ -194,7 +203,6 @@ def get_drivers():
     if users[user].get('role') != 'admin':
         return jsonify({'error': 'Forbidden'}), 403
 
-    # Admins only see drivers assigned to them
     drivers = []
     for uname, udata in users.items():
         if udata.get('role') == 'driver' and udata.get('manager') == user:
@@ -221,7 +229,6 @@ def get_sessions_api():
     all_sessions = load_sessions()
 
     if role == 'admin':
-        # Only sessions from this admin's drivers
         my_drivers = {
             uname for uname, udata in users.items()
             if udata.get('role') == 'driver' and udata.get('manager') == username
@@ -270,6 +277,11 @@ def video_feed():
 
 # ── Detection Thread ─────────────────────────────────────────────
 def run_detection(sid, username, threshold, already_calibrated):
+    """
+    already_calibrated=True  → skip calibration, go straight to detection
+    already_calibrated=False → run calibration first (always, even if user was
+                               previously calibrated — used for recalibration)
+    """
     global latest_frame
 
     try:
@@ -279,9 +291,8 @@ def run_detection(sid, username, threshold, already_calibrated):
         socketio.emit('error', {'msg': str(e)}, to=sid)
         return
 
-    alarm_sound = None
-    if AUDIO_ENABLED and os.path.exists(ALARM_PATH):
-        alarm_sound = mixer.Sound(ALARM_PATH)
+    # Use the module-level alarm sound (loaded once, reused across restarts)
+    alarm_sound = _alarm_sound
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -406,7 +417,6 @@ def run_detection(sid, username, threshold, already_calibrated):
                     session_clips.append(clip_rel)
                     state['last_clip'] = clip_rel
 
-                # Look up driver's manager to target alert to correct admin room
                 users = load_users()
                 driver_manager = users.get(username, {}).get('manager')
                 alert_room = f'admin_room_{driver_manager}' if driver_manager else 'admin_room'
@@ -442,7 +452,6 @@ def run_detection(sid, username, threshold, already_calibrated):
                 'driver': username,
             }, to=sid)
 
-            # Live status to this driver's manager room only
             users = load_users()
             driver_manager = users.get(username, {}).get('manager')
             status_room = f'admin_room_{driver_manager}' if driver_manager else 'admin_room'
@@ -484,9 +493,8 @@ def on_auth(data):
     role = user.get('role', 'driver')
 
     if role == 'admin':
-        # Each admin joins their own private room
         join_room(f'admin_room_{username}')
-        join_room('admin_room')  # keep global room for compatibility
+        join_room('admin_room')
         emit('auth_ok', {'username': username, 'role': role, 'name': user.get('name', username)})
         return
 
@@ -507,6 +515,9 @@ def on_auth(data):
 def on_start(data=None):
     sid = request.sid
     token = (data or {}).get('token')
+    # ── FIX: read force_calibrate flag sent by the client ──────────
+    force_calibrate = (data or {}).get('force_calibrate', False)
+
     username = get_user_from_token(token)
     if not username or sid not in driver_states:
         return
@@ -523,9 +534,12 @@ def on_start(data=None):
     state['alarms'] = 0
     _stop_events[sid].clear()
 
+    # ── FIX: if force_calibrate is True, treat as uncalibrated ─────
+    already_calibrated = user.get('calibrated', False) and not force_calibrate
+
     t = threading.Thread(
         target=run_detection,
-        args=(sid, username, state['threshold'], user.get('calibrated', False)),
+        args=(sid, username, state['threshold'], already_calibrated),
         daemon=True,
     )
     _detector_threads[sid] = t

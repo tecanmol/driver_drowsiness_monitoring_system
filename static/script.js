@@ -26,7 +26,6 @@ function selectRole(r) {
   selectedRole = r;
   document.getElementById('role-driver').classList.toggle('active', r === 'driver');
   document.getElementById('role-admin').classList.toggle('active', r === 'admin');
-  // Show/hide manager selector depending on role
   document.getElementById('manager-group').classList.toggle('hidden', r !== 'driver');
   if (r === 'driver') loadManagersForSignup();
 }
@@ -39,7 +38,6 @@ async function loadManagersForSignup() {
   const loading = document.getElementById('manager-loading');
   const display = document.getElementById('manager-selected-display');
 
-  // Already picked — don't re-render the list
   if (selectedManager) return;
 
   loading.classList.remove('hidden');
@@ -77,12 +75,9 @@ async function loadManagersForSignup() {
 
 function selectManager(username, name) {
   selectedManager = { username, name };
-
-  // Hide the list, show the selected display
   document.getElementById('manager-list').classList.add('hidden');
   document.getElementById('manager-empty').classList.add('hidden');
   document.getElementById('manager-loading').classList.add('hidden');
-
   document.getElementById('mgr-avatar').textContent = name[0].toUpperCase();
   document.getElementById('mgr-name').textContent = name;
   document.getElementById('mgr-username').textContent = '@' + username;
@@ -92,7 +87,6 @@ function selectManager(username, name) {
 function clearManagerSelection() {
   selectedManager = null;
   document.getElementById('manager-selected-display').classList.add('hidden');
-  // Re-show the list
   document.getElementById('manager-list').classList.remove('hidden');
 }
 
@@ -126,10 +120,8 @@ async function doSignup() {
   const password = document.getElementById('signup-pass').value;
   const errEl = document.getElementById('signup-error');
 
-  // Drivers must pick a manager if any exist
   if (selectedRole === 'driver' && !selectedManager) {
     const empty = document.getElementById('manager-empty');
-    // Only block if managers actually exist (empty notice is hidden means list loaded)
     if (empty.classList.contains('hidden')) {
       errEl.textContent = 'Please select a fleet manager.';
       errEl.classList.remove('hidden');
@@ -200,7 +192,6 @@ function showApp() {
     }
     updateCalibStatus(u.calibrated, u.threshold);
 
-    // Show manager chip if driver has one
     if (u.manager) {
       showManagerChip(u.manager);
     }
@@ -211,7 +202,6 @@ function showApp() {
 }
 
 function showManagerChip(managerUsername) {
-  // Fetch the manager's display name
   fetch('/api/admins')
     .then(r => r.json())
     .then(admins => {
@@ -318,6 +308,7 @@ function initDriverSocket() {
     document.getElementById('mean-ear').textContent = 'mean ' + mean.toFixed(3);
 
     updateChart(d);
+    // ── FIX: always call updateTrend after every frame ────────────
     updateTrend();
   });
 
@@ -379,6 +370,8 @@ function toggleDetect() {
   else socket.emit('stop');
 }
 
+// ── FIX: startCalib now sends force_calibrate=true so the server
+//         always runs calibration even if user was already calibrated
 function startCalib() {
   document.getElementById('recalib-confirm').classList.add('hidden');
   socket.emit('stop');
@@ -387,7 +380,7 @@ function startCalib() {
   document.getElementById('ring').style.strokeDashoffset = '408';
   document.getElementById('calib-result').classList.add('hidden');
   setTimeout(() => {
-    socket.emit('start', { token });
+    socket.emit('start', { token, force_calibrate: true });
     document.getElementById('calib-feed').style.display = 'block';
     document.getElementById('calib-cam-placeholder').style.display = 'none';
   }, 500);
@@ -755,18 +748,38 @@ function updateChart(d) {
   window.earChart.update('none');
 }
 
+// ── EAR trend — works at low FPS (5-6) and high FPS alike ────────
 function updateTrend() {
-  let trend = '—', trendColor = 'var(--sub)';
-  if (earBuf.length > 10) {
-    const r = earBuf.slice(-10);
-    const a1 = r.slice(0,5).reduce((a,b)=>a+b,0)/5;
-    const a2 = r.slice(5).reduce((a,b)=>a+b,0)/5;
-    if (a2 > a1 + 0.002) { trend = '↑ improving'; trendColor = 'var(--green)'; }
-    else if (a2 < a1 - 0.002) { trend = '↓ declining'; trendColor = 'var(--red)'; }
-    else { trend = '→ stable'; trendColor = 'var(--sub)'; }
+  let trend = "—";
+
+  // Only need 6 frames (split 3+3); kicks in after ~1s at 5 FPS
+  const MIN = 6;
+  if (earBuf.length >= MIN) {
+    const recent   = earBuf.slice(-MIN);
+    const half     = MIN / 2;
+    const firstAvg = recent.slice(0, half).reduce((a, b) => a + b, 0) / half;
+    const lastAvg  = recent.slice(half).reduce((a, b) => a + b, 0) / half;
+
+    if (lastAvg > firstAvg + 0.002) {
+      trend = "↑ improving";
+    } else if (lastAvg < firstAvg - 0.002) {
+      trend = "↓ drowsy";
+    } else {
+      trend = "→ stable";
+    }
   }
-  const el = document.getElementById('ear-trend');
-  if (el) { el.textContent = trend; el.style.color = trendColor; }
+
+  const trendEl = document.getElementById('ear-trend');
+  if (!trendEl) return;
+  trendEl.textContent = trend;
+
+  if (trend.includes("↑")) {
+    trendEl.style.color = "var(--green)";
+  } else if (trend.includes("↓")) {
+    trendEl.style.color = "var(--red)";
+  } else {
+    trendEl.style.color = "var(--sub)";
+  }
 }
 
 // ══ UI HELPERS ═══════════════════════════════════════════════════
@@ -776,6 +789,8 @@ function setBanner(type, msg) {
   el.textContent = msg;
 }
 
+// ── FIX: setIdle resets detection UI but does NOT touch ear-trend
+//         (trend stays visible until next session starts fresh)
 function setIdle() {
   document.getElementById('ear-num').textContent = '—';
   document.getElementById('ear-num').className = 'ear-num ok';
@@ -784,6 +799,9 @@ function setIdle() {
   document.getElementById('frame-ct').textContent = '0 / 45';
   document.getElementById('thr-label').textContent = '— waiting —';
   document.getElementById('fps-stat').textContent = '—';
+  // Reset trend when session ends so it shows fresh on next start
+  const trendEl = document.getElementById('ear-trend');
+  if (trendEl) { trendEl.textContent = '—'; trendEl.style.color = 'var(--sub)'; }
 }
 
 let _toastEl;
